@@ -30,7 +30,7 @@ NUMERIC_CANDIDATES = ["umur", "los"]
 BASE_PARAMS = {
     "loss_function": "Logloss",
     "eval_metric": "PRAUC",
-    "iterations": 5000,
+    "iterations": 10000,
     "learning_rate": 0.03,
     "depth": 6,
     "l2_leaf_reg": 5.0,
