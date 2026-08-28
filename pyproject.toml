@@ -17,6 +17,11 @@ dependencies = [
     "scikit-learn>=1.6",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
 [project.scripts]
 prs-its = "prs_its:main"
 
