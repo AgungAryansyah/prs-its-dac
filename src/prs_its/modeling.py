@@ -280,6 +280,7 @@ def train_catboost_cv(
     return {
         "oof_pred": oof_pred,
         "test_pred": test_pred,
+        "test_fold_predictions": np.vstack(test_fold_predictions),
         "models": models,
         "fold_metrics": pd.DataFrame(fold_metrics),
         "fold_id": fold_id,
