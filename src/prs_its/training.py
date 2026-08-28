@@ -15,6 +15,7 @@ import pandas as pd
 import sklearn
 from catboost import Pool
 from sklearn.model_selection import StratifiedKFold
+from tqdm.auto import tqdm
 
 from prs_its.calibration import (
     calibrate_test_predictions,
@@ -51,6 +52,8 @@ class TrainingConfig:
     n_splits: int = N_SPLITS
     random_state: int = RANDOM_STATE
     early_stopping_rounds: int = 200
+    show_progress: bool = True
+    catboost_verbose: int = 100
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -337,67 +340,91 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     )
     gpu_status = ensure_gpu_ready(config.devices) if task_type == "GPU" else "CPU explicitly selected"
 
+    experiment_specs = _experiment_specs(baseline, count_features)
+    progress = tqdm(
+        total=(len(experiment_specs) + 1) * config.n_splits,
+        desc="CatBoost folds",
+        unit="fold",
+        disable=not config.show_progress,
+    )
+
+    def fold_progress(name: str):
+        def update(event: str, fold: int) -> None:
+            progress.set_postfix_str(f"{name}, fold {fold + 1}/{config.n_splits}")
+            if event == "complete":
+                progress.update(1)
+
+        return update
+
     experiment_runs: dict[str, dict[str, Any]] = {}
-    for name, prepared, params, notes in _experiment_specs(baseline, count_features):
-        result = train_catboost_cv(
-            prepared.X,
+    try:
+        for index, (name, prepared, params, notes) in enumerate(experiment_specs, start=1):
+            progress.set_description(f"Experiment {index}/{len(experiment_specs)}")
+            result = train_catboost_cv(
+                prepared.X,
+                y,
+                prepared.X_test,
+                spec.categorical_features,
+                cv=cv,
+                params=params,
+                task_type=task_type,
+                devices=config.devices,
+                early_stopping_rounds=config.early_stopping_rounds,
+                verbose=config.catboost_verbose if config.show_progress else False,
+                progress_callback=fold_progress(name),
+            )
+            result.update(
+                {
+                    "experiment_name": name,
+                    "notes": notes,
+                    "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
+                    "prepared": prepared,
+                }
+            )
+            result["models"].clear()
+            experiment_runs[name] = result
+
+        experiment_rows = []
+        for name, result in experiment_runs.items():
+            fold_metrics = result["fold_metrics"]
+            experiment_rows.append(
+                {
+                    "experiment_name": name,
+                    "feature_set": "count_features" if name == "count_features" else "original",
+                    "params": json.dumps(result["params"], sort_keys=True, default=str),
+                    "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
+                    "cv_strategy": "StratifiedKFold",
+                    **result["oof_metrics"],
+                    "mean_best_iteration": fold_metrics["best_iteration"].mean(),
+                    "fold_normalized_recall_5_std": fold_metrics[
+                        "normalized_recall_at_5pct"
+                    ].std(),
+                    "fairness_audit_rate_gap_5": _fairness_gap(train, y, result["oof_pred"]),
+                    "notes": result["notes"],
+                }
+            )
+        experiment_results = pd.DataFrame(experiment_rows)
+        experiment_results.to_csv(paths["metrics"] / "catboost_experiments.csv", index=False)
+        selected_name = _select_experiment(experiment_results)
+        selected = experiment_runs[selected_name]
+        progress.set_description("Final ensemble")
+        final_run = train_catboost_cv(
+            selected["prepared"].X,
             y,
-            prepared.X_test,
+            selected["prepared"].X_test,
             spec.categorical_features,
             cv=cv,
-            params=params,
+            params=selected["params"],
             task_type=task_type,
             devices=config.devices,
             early_stopping_rounds=config.early_stopping_rounds,
+            model_dir=paths["models"],
+            model_prefix="catboost",
+            verbose=config.catboost_verbose if config.show_progress else False,
+            progress_callback=fold_progress("final ensemble"),
         )
-        result.update(
-            {
-                "experiment_name": name,
-                "notes": notes,
-                "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
-                "prepared": prepared,
-            }
-        )
-        result["models"].clear()
-        experiment_runs[name] = result
-
-    experiment_rows = []
-    for name, result in experiment_runs.items():
-        fold_metrics = result["fold_metrics"]
-        experiment_rows.append(
-            {
-                "experiment_name": name,
-                "feature_set": "count_features" if name == "count_features" else "original",
-                "params": json.dumps(result["params"], sort_keys=True, default=str),
-                "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
-                "cv_strategy": "StratifiedKFold",
-                **result["oof_metrics"],
-                "mean_best_iteration": fold_metrics["best_iteration"].mean(),
-                "fold_normalized_recall_5_std": fold_metrics[
-                    "normalized_recall_at_5pct"
-                ].std(),
-                "fairness_audit_rate_gap_5": _fairness_gap(train, y, result["oof_pred"]),
-                "notes": result["notes"],
-            }
-        )
-    experiment_results = pd.DataFrame(experiment_rows)
-    experiment_results.to_csv(paths["metrics"] / "catboost_experiments.csv", index=False)
-    selected_name = _select_experiment(experiment_results)
-    selected = experiment_runs[selected_name]
-
-    final_run = train_catboost_cv(
-        selected["prepared"].X,
-        y,
-        selected["prepared"].X_test,
-        spec.categorical_features,
-        cv=cv,
-        params=selected["params"],
-        task_type=task_type,
-        devices=config.devices,
-        early_stopping_rounds=config.early_stopping_rounds,
-        model_dir=paths["models"],
-        model_prefix="catboost",
-    )
+    finally:
+        progress.close()
     raw_oof_pred = final_run["oof_pred"]
     raw_test_pred = final_run["test_pred"]
     raw_metrics = evaluate_probabilities(y, raw_oof_pred)
@@ -533,6 +560,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--task-type", choices=["CPU", "GPU"], default=os.environ.get("PRS_ITS_TASK_TYPE", "GPU").upper())
     parser.add_argument("--devices", default=os.environ.get("PRS_ITS_GPU_DEVICES", "0"))
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--catboost-verbose", type=int, default=100)
     return parser.parse_args()
 
 
@@ -542,6 +571,8 @@ def main() -> None:
         project_root=find_project_root(args.project_root),
         task_type=args.task_type,
         devices=args.devices,
+        show_progress=not args.quiet,
+        catboost_verbose=args.catboost_verbose,
     )
     result = run_training(config)
     print(json.dumps(result, default=str, indent=2))

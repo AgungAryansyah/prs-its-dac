@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import subprocess
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -210,6 +210,8 @@ def train_catboost_cv(
     early_stopping_rounds: int = 200,
     model_dir: Path | None = None,
     model_prefix: str = "catboost",
+    verbose: int | bool = False,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
@@ -233,6 +235,8 @@ def train_catboost_cv(
         model_dir.mkdir(parents=True, exist_ok=True)
 
     for fold, (train_idx, valid_idx) in enumerate(cv.split(X, y)):
+        if progress_callback is not None:
+            progress_callback("start", fold)
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
         model = CatBoostClassifier(**model_params)
@@ -242,7 +246,7 @@ def train_catboost_cv(
             cat_features=categorical_features,
             eval_set=(X_valid, y_valid),
             early_stopping_rounds=early_stopping_rounds,
-            verbose=False,
+            verbose=verbose,
         )
         valid_pred = model.predict_proba(X_valid)[:, 1]
         oof_pred[valid_idx] = valid_pred
@@ -271,6 +275,8 @@ def train_catboost_cv(
         if model_dir is not None:
             model.save_model(model_dir / f"{model_prefix}_fold_{fold}.cbm")
         models.append(model)
+        if progress_callback is not None:
+            progress_callback("complete", fold)
 
     if (fold_id < 0).any():
         raise RuntimeError("Every training row must receive exactly one OOF prediction.")

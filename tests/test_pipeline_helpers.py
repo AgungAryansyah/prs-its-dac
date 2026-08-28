@@ -63,6 +63,7 @@ def test_cpu_cv_produces_complete_oof_and_fold_models(tmp_path) -> None:
     train, test = _datasets()
     spec = make_feature_spec(train, test)
     prepared = prepare_catboost_features(train, test, spec)
+    progress_events = []
     result = train_catboost_cv(
         prepared.X,
         prepared.y,
@@ -73,6 +74,7 @@ def test_cpu_cv_produces_complete_oof_and_fold_models(tmp_path) -> None:
         task_type="CPU",
         early_stopping_rounds=3,
         model_dir=tmp_path,
+        progress_callback=lambda event, fold: progress_events.append((event, fold)),
     )
 
     assert (result["fold_id"] >= 0).all()
@@ -81,6 +83,7 @@ def test_cpu_cv_produces_complete_oof_and_fold_models(tmp_path) -> None:
     assert result["test_fold_predictions"].shape == (2, len(prepared.X_test))
     assert len(result["fold_metrics"]) == 2
     assert len(list(tmp_path.glob("catboost_fold_*.cbm"))) == 2
+    assert progress_events == [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
 
 
 def test_cross_fit_calibration_and_submission_helpers(tmp_path) -> None:
