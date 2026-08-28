@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 prs-its = "prs_its:main"
+prs-its-train = "prs_its.training:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
