@@ -299,6 +299,9 @@ def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> di
         [run["fold_metrics"].assign(random_seed=seed) for seed, run in seed_runs.items()],
         ignore_index=True,
     )
+    for seed, run in seed_runs.items():
+        if seed != first_seed:
+            run["models"].clear()
     return {
         "oof_pred": oof_pred,
         "test_pred": test_pred,
