@@ -51,6 +51,32 @@ def test_feature_preparation_preserves_schema_and_fills_categories() -> None:
     assert {"secondary_diagnosis_count", "procedure_count"} <= set(prepared.X)
 
 
+def test_refined_feature_preparation_adds_consistent_categorical_features() -> None:
+    train, test = _datasets()
+    spec = make_feature_spec(train, test)
+    prepared = prepare_catboost_features(
+        train,
+        test,
+        spec,
+        add_count_features=True,
+        add_interaction_features=True,
+        add_los_features=True,
+    )
+
+    expected_categorical = {
+        "typeppk_cmg",
+        "cmg_severitylevel",
+        "diagprimer_cmg",
+        "los_bucket",
+    }
+    assert expected_categorical <= set(prepared.categorical_features)
+    assert expected_categorical <= set(prepared.X)
+    assert list(prepared.X.columns) == list(prepared.X_test.columns)
+    assert prepared.X.loc[0, "los_bucket"] == "0"
+    assert prepared.X.loc[0, "los_zero_indicator"] == 1
+    assert "claim_id" not in prepared.X
+
+
 def test_schema_validation_rejects_mismatched_order() -> None:
     train, test = _datasets()
     reordered = test.loc[:, ["claim_id", *reversed(test.columns.drop("claim_id").tolist())]]

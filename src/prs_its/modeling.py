@@ -27,6 +27,11 @@ CATEGORICAL_CANDIDATES = [
     "diagprimer",
 ]
 NUMERIC_CANDIDATES = ["umur", "los"]
+INTERACTION_FEATURES = {
+    "typeppk_cmg": ("typeppk", "cmg"),
+    "cmg_severitylevel": ("cmg", "severitylevel"),
+    "diagprimer_cmg": ("diagprimer", "cmg"),
+}
 BASE_PARAMS = {
     "loss_function": "Logloss",
     "eval_metric": "PRAUC",
@@ -59,6 +64,7 @@ class PreparedFeatures:
     y: pd.Series
     X_test: pd.DataFrame
     spec: FeatureSpec
+    categorical_features: list[str]
 
 
 def code_like_dtypes(columns: Iterable[str] = CATEGORICAL_CANDIDATES) -> dict[str, str]:
@@ -130,6 +136,8 @@ def prepare_catboost_features(
     spec: FeatureSpec,
     target: str = TARGET,
     add_count_features: bool = False,
+    add_interaction_features: bool = False,
+    add_los_features: bool = False,
 ) -> PreparedFeatures:
     X = train.loc[:, spec.features].copy()
     X_test = test.loc[:, spec.features].copy()
@@ -138,6 +146,7 @@ def prepare_catboost_features(
     for column in spec.categorical_features:
         X[column] = X[column].astype("string").fillna("__MISSING__").astype(str)
         X_test[column] = X_test[column].astype("string").fillna("__MISSING__").astype(str)
+    categorical_features = list(spec.categorical_features)
 
     if add_count_features:
         diagnosis_columns = [column for column in spec.features if column.startswith("dx2_")]
@@ -155,9 +164,38 @@ def prepare_catboost_features(
             pd.to_numeric, errors="coerce"
         ).sum(axis=1, min_count=1)
 
+    if add_interaction_features:
+        for name, columns in INTERACTION_FEATURES.items():
+            X[name] = X.loc[:, columns].agg("__".join, axis=1)
+            X_test[name] = X_test.loc[:, columns].agg("__".join, axis=1)
+            categorical_features.append(name)
+
+    if add_los_features:
+        for frame in (X, X_test):
+            los = pd.to_numeric(frame["los"], errors="coerce")
+            frame["los_zero_indicator"] = np.where(los.notna(), (los == 0).astype(int), np.nan)
+            frame["los_bucket"] = (
+                pd.cut(
+                    los,
+                    bins=[-np.inf, 0, 1, 3, 7, 14, np.inf],
+                    labels=["0", "1", "2-3", "4-7", "8-14", "15+"],
+                    include_lowest=True,
+                )
+                .astype("string")
+                .fillna("__MISSING__")
+                .astype(str)
+            )
+        categorical_features.append("los_bucket")
+
     if list(X.columns) != list(X_test.columns):
         raise ValueError("Prepared train and test features are not aligned.")
-    return PreparedFeatures(X=X, y=y, X_test=X_test, spec=spec)
+    return PreparedFeatures(
+        X=X,
+        y=y,
+        X_test=X_test,
+        spec=spec,
+        categorical_features=categorical_features,
+    )
 
 
 def ensure_gpu_ready(devices: str = "0") -> str:
