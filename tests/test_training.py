@@ -37,7 +37,26 @@ def _fake_train_catboost_cv(X, y, X_test, categorical_features, cv, params, task
     probabilities = np.where(y.to_numpy() == 1, 0.8, 0.2)
     metrics = evaluate_probabilities(y, probabilities)
     fold_metrics = pd.DataFrame(
-        [{**metrics, "best_iteration": 3}, {**metrics, "best_iteration": 4}]
+        [
+            {
+                **metrics,
+                "fold": 0,
+                "train_size": len(X) // 2,
+                "valid_size": len(X) // 2,
+                "train_fraud_prevalence": 0.5,
+                "valid_fraud_prevalence": 0.5,
+                "best_iteration": 3,
+            },
+            {
+                **metrics,
+                "fold": 1,
+                "train_size": len(X) // 2,
+                "valid_size": len(X) // 2,
+                "train_fraud_prevalence": 0.5,
+                "valid_fraud_prevalence": 0.5,
+                "best_iteration": 4,
+            },
+        ]
     )
     return {
         "oof_pred": probabilities,
@@ -77,6 +96,13 @@ def test_python_training_orchestration_writes_core_artifacts(tmp_path, monkeypat
 
 def test_refined_profile_uses_isolated_outputs_and_iteration_override(tmp_path, monkeypatch) -> None:
     _configure_training_test(tmp_path, monkeypatch)
+    calls = []
+
+    def tracked_train_catboost_cv(*args, **kwargs):
+        calls.append(kwargs["params"]["random_seed"])
+        return _fake_train_catboost_cv(*args, **kwargs)
+
+    monkeypatch.setattr(training, "train_catboost_cv", tracked_train_catboost_cv)
 
     result = training.run_training(
         training.TrainingConfig(
@@ -98,3 +124,7 @@ def test_refined_profile_uses_isolated_outputs_and_iteration_override(tmp_path, 
     )
     assert experiments["params"].str.contains('"iterations": 12').all()
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
+    assert calls[-3:] == [42, 2026, 2718]
+    assert len(calls) == 12
+    assert (run_dir / "oof" / "catboost_oof_seed_42.csv").exists()
+    assert (run_dir / "metrics" / "catboost_seed_fold_metrics.csv").exists()

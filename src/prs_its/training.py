@@ -58,6 +58,7 @@ class TrainingConfig:
     profile: str = "baseline"
     run_name: str | None = None
     iterations: int | None = None
+    ensemble_seeds: tuple[int, ...] = (RANDOM_STATE, 2026, 2718)
 
 
 @dataclass(frozen=True)
@@ -253,6 +254,65 @@ def _with_iteration_cap(params: dict[str, Any], iterations: int | None) -> dict[
     if iterations <= 0:
         raise ValueError("iterations must be positive.")
     return {**params, "iterations": iterations}
+
+
+def _validate_ensemble_seeds(seeds: tuple[int, ...]) -> None:
+    if not seeds:
+        raise ValueError("ensemble_seeds must not be empty.")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("ensemble_seeds must be unique.")
+
+
+def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> dict[str, Any]:
+    first_seed, first_run = next(iter(seed_runs.items()))
+    fold_id = np.asarray(first_run["fold_id"])
+    for seed, run in seed_runs.items():
+        if not np.array_equal(fold_id, run["fold_id"]):
+            raise RuntimeError(f"Seed {seed} did not use the same validation folds.")
+
+    oof_pred = np.mean(np.vstack([run["oof_pred"] for run in seed_runs.values()]), axis=0)
+    test_pred = np.mean(np.vstack([run["test_pred"] for run in seed_runs.values()]), axis=0)
+    fold_metrics = []
+    for fold in np.unique(fold_id):
+        valid_mask = fold_id == fold
+        metrics = evaluate_probabilities(y.iloc[valid_mask], oof_pred[valid_mask])
+        seed_metrics = pd.concat(
+            [run["fold_metrics"].query("fold == @fold") for run in seed_runs.values()],
+            ignore_index=True,
+        )
+        metrics.update(
+            {
+                "fold": int(fold),
+                "train_size": int(seed_metrics["train_size"].iloc[0]),
+                "valid_size": int(valid_mask.sum()),
+                "train_fraud_prevalence": float(seed_metrics["train_fraud_prevalence"].iloc[0]),
+                "valid_fraud_prevalence": float(y.iloc[valid_mask].mean()),
+                "best_iteration": float(seed_metrics["best_iteration"].mean()),
+            }
+        )
+        fold_metrics.append(metrics)
+
+    seed_fold_metrics = pd.concat(
+        [run["fold_metrics"].assign(random_seed=seed) for seed, run in seed_runs.items()],
+        ignore_index=True,
+    )
+    return {
+        "oof_pred": oof_pred,
+        "test_pred": test_pred,
+        "test_fold_predictions": np.vstack(
+            [run["test_fold_predictions"] for run in seed_runs.values()]
+        ),
+        "models": first_run["models"],
+        "fold_metrics": pd.DataFrame(fold_metrics),
+        "fold_id": fold_id,
+        "feature_importance": pd.concat(
+            [run["feature_importance"] for run in seed_runs.values()], ignore_index=True
+        ),
+        "params": first_run["params"],
+        "seed_runs": seed_runs,
+        "seed_fold_metrics": seed_fold_metrics,
+        "explanation_seed": first_seed,
+    }
 
 
 def _fairness_gap(train: pd.DataFrame, y: pd.Series, probabilities: np.ndarray) -> float:
@@ -489,8 +549,13 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             interaction_features,
             combined_features,
         )
+    if config.profile == "refined":
+        _validate_ensemble_seeds(config.ensemble_seeds)
+        final_training_runs = len(config.ensemble_seeds)
+    else:
+        final_training_runs = 1
     progress = tqdm(
-        total=(len(experiment_specs) + 1) * config.n_splits,
+        total=(len(experiment_specs) + final_training_runs) * config.n_splits,
         desc="CatBoost folds",
         unit="fold",
         disable=not config.show_progress,
@@ -559,36 +624,75 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         experiment_results.to_csv(paths["metrics"] / "catboost_experiments.csv", index=False)
         selected_name = _select_experiment(experiment_results)
         selected = experiment_runs[selected_name]
-        progress.set_description("Final ensemble")
-        final_run = train_catboost_cv(
-            selected["prepared"].X,
-            y,
-            selected["prepared"].X_test,
-            selected["prepared"].categorical_features,
-            cv=cv,
-            params=selected["params"],
-            task_type=task_type,
-            devices=config.devices,
-            early_stopping_rounds=config.early_stopping_rounds,
-            model_dir=paths["models"],
-            model_prefix="catboost",
-            verbose=config.catboost_verbose if config.show_progress else False,
-            progress_callback=fold_progress("final ensemble"),
-        )
+        if config.profile == "baseline":
+            progress.set_description("Final ensemble")
+            final_run = train_catboost_cv(
+                selected["prepared"].X,
+                y,
+                selected["prepared"].X_test,
+                selected["prepared"].categorical_features,
+                cv=cv,
+                params=selected["params"],
+                task_type=task_type,
+                devices=config.devices,
+                early_stopping_rounds=config.early_stopping_rounds,
+                model_dir=paths["models"],
+                model_prefix="catboost",
+                verbose=config.catboost_verbose if config.show_progress else False,
+                progress_callback=fold_progress("final ensemble"),
+            )
+        else:
+            seed_runs = {}
+            for seed in config.ensemble_seeds:
+                progress.set_description(f"Seed ensemble {seed}")
+                seed_runs[seed] = train_catboost_cv(
+                    selected["prepared"].X,
+                    y,
+                    selected["prepared"].X_test,
+                    selected["prepared"].categorical_features,
+                    cv=cv,
+                    params={**selected["params"], "random_seed": seed},
+                    task_type=task_type,
+                    devices=config.devices,
+                    early_stopping_rounds=config.early_stopping_rounds,
+                    model_dir=paths["models"],
+                    model_prefix=f"catboost_seed_{seed}",
+                    verbose=config.catboost_verbose if config.show_progress else False,
+                    progress_callback=fold_progress(f"seed {seed}"),
+                )
+            final_run = _combine_seed_runs(seed_runs, y)
     finally:
         progress.close()
     raw_oof_pred = final_run["oof_pred"]
     raw_test_pred = final_run["test_pred"]
     raw_metrics = evaluate_probabilities(y, raw_oof_pred)
-    calibrated_candidates = []
+    calibrated_candidates: list[tuple[str, np.ndarray, dict[str, float | int]]] = []
     for method in ("sigmoid", "isotonic"):
         calibrated = cross_fit_calibration(y, raw_oof_pred, final_run["fold_id"], method)
         metrics = evaluate_probabilities(y, calibrated["oof_pred"])
         calibrated_candidates.append((method, calibrated["oof_pred"], metrics))
+    calibration_rows = [{"prediction_type": "raw", **raw_metrics}]
+    calibration_rows.extend(
+        {"prediction_type": method, **metrics} for method, _, metrics in calibrated_candidates
+    )
     eligible_calibration = [
         candidate for candidate in calibrated_candidates if should_select_calibration(raw_metrics, candidate[2])
     ]
-    if eligible_calibration:
+    calibration_sidecar_method: str | None = None
+    calibration_sidecar_pred: np.ndarray | None = None
+    if config.profile == "refined":
+        final_oof_pred = raw_oof_pred
+        final_metrics = raw_metrics
+        final_test_pred = raw_test_pred
+        calibration_method = "raw"
+        if eligible_calibration:
+            calibration_sidecar_method, _, _ = min(
+                eligible_calibration, key=lambda candidate: candidate[2]["brier_score"]
+            )
+            calibration_sidecar_pred = calibrate_test_predictions(
+                raw_oof_pred, y, raw_test_pred, calibration_sidecar_method
+            )
+    elif eligible_calibration:
         calibration_method, final_oof_pred, final_metrics = min(
             eligible_calibration, key=lambda candidate: candidate[2]["brier_score"]
         )
@@ -600,6 +704,24 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         final_oof_pred = raw_oof_pred
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
+
+    if config.profile == "refined":
+        for seed, seed_run in final_run["seed_runs"].items():
+            pd.DataFrame(
+                {
+                    ID_COL: train[ID_COL],
+                    TARGET: y,
+                    "fold": seed_run["fold_id"],
+                    "random_seed": seed,
+                    "fraud_probability_raw": seed_run["oof_pred"],
+                }
+            ).to_csv(paths["oof"] / f"catboost_oof_seed_{seed}.csv", index=False)
+        final_run["seed_fold_metrics"].to_csv(
+            paths["metrics"] / "catboost_seed_fold_metrics.csv", index=False
+        )
+        pd.DataFrame(calibration_rows).to_csv(
+            paths["metrics"] / "catboost_calibration_comparison.csv", index=False
+        )
 
     oof_output = pd.DataFrame(
         {
@@ -663,6 +785,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             "random_state": config.random_state,
         },
         "calibration": calibration_method,
+        "calibration_sidecar": calibration_sidecar_method,
+        "ensemble_seeds": list(config.ensemble_seeds) if config.profile == "refined" else None,
         "gpu_status": gpu_status,
         "versions": {
             "python": platform.python_version(),
@@ -677,6 +801,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     submission = make_submission(
         test[ID_COL], final_test_pred, paths["submissions"] / "catboost_submission.csv"
     )
+    calibrated_submission_path = None
+    if calibration_sidecar_pred is not None:
+        calibrated_submission_path = paths["submissions"] / "catboost_calibrated_submission.csv"
+        make_submission(test[ID_COL], calibration_sidecar_pred, calibrated_submission_path)
     findings = pd.DataFrame(
         [
             {
@@ -689,7 +817,11 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "Finding": "Final probability treatment",
                 "Evidence": calibration_method,
                 "Decision": calibration_method,
-                "Reason": "Calibration must improve Brier without unacceptable ranking loss.",
+                "Reason": (
+                    "Raw probabilities preserve the audit ranking."
+                    if config.profile == "refined"
+                    else "Calibration must improve Brier without unacceptable ranking loss."
+                ),
             },
             {
                 "Finding": "Audit portfolio at 5%",
@@ -707,6 +839,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         "metrics": final_metrics,
         "submission_path": paths["submissions"] / "catboost_submission.csv",
         "submission_rows": len(submission),
+        "calibrated_submission_path": calibrated_submission_path,
     }
 
 
@@ -724,7 +857,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=["baseline", "refined"], default="baseline")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--ensemble-seeds", default="42,2026,2718")
     return parser.parse_args()
+
+
+def parse_ensemble_seeds(raw_seeds: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(value.strip()) for value in raw_seeds.split(",") if value.strip())
+    except ValueError as error:
+        raise ValueError("ensemble_seeds must be comma-separated integers.") from error
+    _validate_ensemble_seeds(seeds)
+    return seeds
 
 
 def main() -> None:
@@ -738,6 +881,7 @@ def main() -> None:
         profile=args.profile,
         run_name=args.run_name,
         iterations=args.iterations,
+        ensemble_seeds=parse_ensemble_seeds(args.ensemble_seeds),
     )
     result = run_training(config)
     print(json.dumps(result, default=str, indent=2))
