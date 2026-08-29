@@ -69,6 +69,74 @@ def audit_metrics(
     }
 
 
+def bootstrap_audit_intervals(
+    y_true: Iterable[int] | np.ndarray,
+    y_prob: Iterable[float] | np.ndarray,
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> list[dict[str, float | int | str]]:
+    if n_bootstrap <= 0:
+        raise ValueError("n_bootstrap must be positive.")
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be within (0, 1).")
+
+    labels, probabilities = _validated_arrays(y_true, y_prob)
+    metrics_by_fraction = {
+        fraction: audit_metrics(labels, probabilities, fraction) for fraction in audit_fractions
+    }
+    metric_names = (
+        "fraud_caught",
+        "legitimate_audits",
+        "recall",
+        "normalized_recall",
+        "precision",
+        "lift",
+    )
+    samples = {
+        fraction: {name: np.empty(n_bootstrap, dtype=float) for name in metric_names}
+        for fraction in audit_fractions
+    }
+    random = np.random.default_rng(random_state)
+    for iteration in range(n_bootstrap):
+        sampled_indices = random.integers(0, len(labels), size=len(labels))
+        sampled_labels = labels[sampled_indices]
+        sorted_labels = sampled_labels[np.argsort(-probabilities[sampled_indices], kind="mergesort")]
+        cumulative_fraud = np.cumsum(sorted_labels)
+        total_fraud = int(sampled_labels.sum())
+        prevalence = total_fraud / len(sampled_labels)
+        for fraction in audit_fractions:
+            audit_count = int(np.floor(len(sampled_labels) * fraction))
+            fraud_caught = int(cumulative_fraud[audit_count - 1]) if audit_count else 0
+            precision = fraud_caught / audit_count if audit_count else 0.0
+            maximum_capturable = min(audit_count, total_fraud)
+            samples[fraction]["fraud_caught"][iteration] = fraud_caught
+            samples[fraction]["legitimate_audits"][iteration] = audit_count - fraud_caught
+            samples[fraction]["recall"][iteration] = fraud_caught / total_fraud if total_fraud else 0.0
+            samples[fraction]["normalized_recall"][iteration] = (
+                fraud_caught / maximum_capturable if maximum_capturable else 0.0
+            )
+            samples[fraction]["precision"][iteration] = precision
+            samples[fraction]["lift"][iteration] = precision / prevalence if prevalence else 0.0
+
+    lower_quantile = (1 - confidence_level) / 2
+    upper_quantile = 1 - lower_quantile
+    return [
+        {
+            "audit_fraction": fraction,
+            "metric": metric_name,
+            "estimate": float(metrics_by_fraction[fraction][metric_name]),
+            "ci_lower": float(np.quantile(samples[fraction][metric_name], lower_quantile)),
+            "ci_upper": float(np.quantile(samples[fraction][metric_name], upper_quantile)),
+            "n_bootstrap": n_bootstrap,
+            "confidence_level": confidence_level,
+        }
+        for fraction in audit_fractions
+        for metric_name in metric_names
+    ]
+
+
 def evaluate_probabilities(
     y_true: Iterable[int] | np.ndarray,
     y_prob: Iterable[float] | np.ndarray,

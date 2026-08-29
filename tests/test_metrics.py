@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from prs_its.metrics import audit_metrics, evaluate_probabilities, normalized_recall_at_budget
+from prs_its.metrics import (
+    audit_metrics,
+    bootstrap_audit_intervals,
+    evaluate_probabilities,
+    normalized_recall_at_budget,
+)
 
 
 def test_perfect_ranking_captures_all_fraud_at_budget() -> None:
@@ -48,3 +53,43 @@ def test_probability_validation_rejects_invalid_probabilities() -> None:
 
     with pytest.raises(ValueError, match="same length"):
         audit_metrics([0, 1], np.array([0.1]))
+
+
+def test_bootstrap_audit_intervals_are_deterministic_and_include_point_estimates() -> None:
+    first = bootstrap_audit_intervals(
+        [1, 1, 0, 0, 0, 1, 0, 0],
+        [0.9, 0.8, 0.7, 0.1, 0.2, 0.6, 0.5, 0.3],
+        audit_fractions=(0.25, 0.5),
+        n_bootstrap=25,
+        random_state=42,
+    )
+    second = bootstrap_audit_intervals(
+        [1, 1, 0, 0, 0, 1, 0, 0],
+        [0.9, 0.8, 0.7, 0.1, 0.2, 0.6, 0.5, 0.3],
+        audit_fractions=(0.25, 0.5),
+        n_bootstrap=25,
+        random_state=42,
+    )
+
+    assert first == second
+    assert len(first) == 12
+    assert {row["metric"] for row in first} == {
+        "fraud_caught",
+        "legitimate_audits",
+        "recall",
+        "normalized_recall",
+        "precision",
+        "lift",
+    }
+    assert all(row["ci_lower"] <= row["ci_upper"] for row in first)
+    assert next(
+        row for row in first if row["audit_fraction"] == 0.25 and row["metric"] == "fraud_caught"
+    )["estimate"] == 2.0
+
+
+def test_bootstrap_audit_intervals_validate_configuration() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        bootstrap_audit_intervals([0, 1], [0.1, 0.9], n_bootstrap=0)
+
+    with pytest.raises(ValueError, match="confidence_level"):
+        bootstrap_audit_intervals([0, 1], [0.1, 0.9], confidence_level=1.0)
