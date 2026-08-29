@@ -46,6 +46,8 @@ def _fake_train_catboost_cv(X, y, X_test, categorical_features, cv, params, task
                 "train_fraud_prevalence": 0.5,
                 "valid_fraud_prevalence": 0.5,
                 "best_iteration": 3,
+                "iteration_cap": params["iterations"],
+                "hit_iteration_cap": False,
             },
             {
                 **metrics,
@@ -55,6 +57,8 @@ def _fake_train_catboost_cv(X, y, X_test, categorical_features, cv, params, task
                 "train_fraud_prevalence": 0.5,
                 "valid_fraud_prevalence": 0.5,
                 "best_iteration": 4,
+                "iteration_cap": params["iterations"],
+                "hit_iteration_cap": False,
             },
         ]
     )
@@ -124,7 +128,9 @@ def test_refined_profile_uses_isolated_outputs_and_iteration_override(tmp_path, 
     )
     assert experiments["params"].str.contains('"iterations": 12').all()
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
-    assert calls[-3:] == [42, 2026, 2718]
-    assert len(calls) == 12
+    assert calls[-4:] == [42, 2026, 2718, 42]
+    assert len(calls) == 13
     assert (run_dir / "oof" / "catboost_oof_seed_42.csv").exists()
     assert (run_dir / "metrics" / "catboost_seed_fold_metrics.csv").exists()
+    grouped = pd.read_csv(run_dir / "metrics" / "catboost_grouped_robustness.csv")
+    assert {"fold", "overall"} == set(grouped["scope"])

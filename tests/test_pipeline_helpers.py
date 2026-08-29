@@ -3,12 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
 from prs_its.calibration import calibrate_test_predictions, cross_fit_calibration
 from prs_its.fairness import age_groups, fairness_audit_rates
 from prs_its.modeling import (
     CATEGORICAL_CANDIDATES,
+    feature_signature_groups,
     make_feature_spec,
     prepare_catboost_features,
     train_catboost_cv,
@@ -109,7 +110,44 @@ def test_cpu_cv_produces_complete_oof_and_fold_models(tmp_path) -> None:
     assert result["test_fold_predictions"].shape == (2, len(prepared.X_test))
     assert len(result["fold_metrics"]) == 2
     assert len(list(tmp_path.glob("catboost_fold_*.cbm"))) == 2
+    assert {"iteration_cap", "hit_iteration_cap"} <= set(result["fold_metrics"])
     assert progress_events == [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
+
+
+def test_feature_signature_groups_keep_duplicate_rows_in_one_validation_fold() -> None:
+    train, test = _datasets()
+    duplicated = pd.concat([train.iloc[:2], train.iloc[:2], train.iloc[2:]], ignore_index=True)
+    duplicated["claim_id"] = [f"CLM_{index:03d}" for index in range(len(duplicated))]
+    spec = make_feature_spec(duplicated, test)
+    prepared = prepare_catboost_features(duplicated, test, spec)
+    groups = feature_signature_groups(prepared.X)
+    cv = StratifiedGroupKFold(n_splits=2, shuffle=True, random_state=42)
+
+    for train_idx, valid_idx in cv.split(prepared.X, prepared.y, groups):
+        assert not set(groups[train_idx]).intersection(groups[valid_idx])
+
+
+def test_cpu_group_cv_reports_no_overlap_without_test_predictions() -> None:
+    train, test = _datasets()
+    spec = make_feature_spec(train, test)
+    prepared = prepare_catboost_features(train, test, spec)
+    groups = feature_signature_groups(prepared.X)
+    result = train_catboost_cv(
+        prepared.X,
+        prepared.y,
+        prepared.X_test,
+        prepared.categorical_features,
+        cv=StratifiedGroupKFold(n_splits=2, shuffle=True, random_state=42),
+        params={"iterations": 10, "depth": 2, "learning_rate": 0.1},
+        task_type="CPU",
+        early_stopping_rounds=3,
+        groups=groups,
+        predict_test=False,
+    )
+
+    assert result["test_pred"] is None
+    assert result["test_fold_predictions"] is None
+    assert result["fold_metrics"]["group_overlap_count"].eq(0).all()
 
 
 def test_cross_fit_calibration_and_submission_helpers(tmp_path) -> None:

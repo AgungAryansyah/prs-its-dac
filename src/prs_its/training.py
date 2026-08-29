@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from catboost import Pool
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from tqdm.auto import tqdm
 
 from prs_its.calibration import (
@@ -37,6 +37,7 @@ from prs_its.modeling import (
     aggregate_feature_importance,
     code_like_dtypes,
     ensure_gpu_ready,
+    feature_signature_groups,
     make_feature_spec,
     prepare_catboost_features,
     train_catboost_cv,
@@ -288,6 +289,8 @@ def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> di
                 "train_fraud_prevalence": float(seed_metrics["train_fraud_prevalence"].iloc[0]),
                 "valid_fraud_prevalence": float(y.iloc[valid_mask].mean()),
                 "best_iteration": float(seed_metrics["best_iteration"].mean()),
+                "iteration_cap": int(seed_metrics["iteration_cap"].iloc[0]),
+                "hit_iteration_cap": bool(seed_metrics["hit_iteration_cap"].any()),
             }
         )
         fold_metrics.append(metrics)
@@ -313,6 +316,40 @@ def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> di
         "seed_fold_metrics": seed_fold_metrics,
         "explanation_seed": first_seed,
     }
+
+
+def _run_grouped_robustness(
+    prepared: PreparedFeatures,
+    y: pd.Series,
+    params: dict[str, Any],
+    config: TrainingConfig,
+    task_type: str,
+    progress_callback: Any,
+) -> dict[str, Any]:
+    groups = feature_signature_groups(prepared.X)
+    cv = StratifiedGroupKFold(
+        n_splits=config.n_splits,
+        shuffle=True,
+        random_state=config.random_state,
+    )
+    result = train_catboost_cv(
+        prepared.X,
+        y,
+        prepared.X_test,
+        prepared.categorical_features,
+        cv=cv,
+        params=params,
+        task_type=task_type,
+        devices=config.devices,
+        early_stopping_rounds=config.early_stopping_rounds,
+        verbose=config.catboost_verbose if config.show_progress else False,
+        progress_callback=progress_callback,
+        groups=groups,
+        predict_test=False,
+    )
+    result["oof_metrics"] = evaluate_probabilities(y, result["oof_pred"])
+    result["feature_group_count"] = int(len(np.unique(groups)))
+    return result
 
 
 def _fairness_gap(train: pd.DataFrame, y: pd.Series, probabilities: np.ndarray) -> float:
@@ -551,7 +588,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         )
     if config.profile == "refined":
         _validate_ensemble_seeds(config.ensemble_seeds)
-        final_training_runs = len(config.ensemble_seeds)
+        final_training_runs = len(config.ensemble_seeds) + 1
     else:
         final_training_runs = 1
     progress = tqdm(
@@ -570,6 +607,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         return update
 
     experiment_runs: dict[str, dict[str, Any]] = {}
+    grouped_run: dict[str, Any] | None = None
     try:
         for index, experiment in enumerate(experiment_specs, start=1):
             name = experiment.name
@@ -613,6 +651,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                     "cv_strategy": "StratifiedKFold",
                     **result["oof_metrics"],
                     "mean_best_iteration": fold_metrics["best_iteration"].mean(),
+                    "iteration_cap": int(result["params"]["iterations"]),
+                    "iteration_cap_hit_rate": fold_metrics["hit_iteration_cap"].mean(),
                     "fold_normalized_recall_5_std": fold_metrics[
                         "normalized_recall_at_5pct"
                     ].std(),
@@ -661,6 +701,15 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                     progress_callback=fold_progress(f"seed {seed}"),
                 )
             final_run = _combine_seed_runs(seed_runs, y)
+            progress.set_description("Grouped robustness")
+            grouped_run = _run_grouped_robustness(
+                selected["prepared"],
+                y,
+                selected["params"],
+                config,
+                task_type,
+                fold_progress("grouped robustness"),
+            )
     finally:
         progress.close()
     raw_oof_pred = final_run["oof_pred"]
@@ -722,6 +771,52 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         pd.DataFrame(calibration_rows).to_csv(
             paths["metrics"] / "catboost_calibration_comparison.csv", index=False
         )
+        screen_fold_metrics = pd.concat(
+            [
+                result["fold_metrics"].assign(
+                    experiment_name=name,
+                    feature_set=result["feature_set"],
+                    cv_strategy="StratifiedKFold",
+                )
+                for name, result in experiment_runs.items()
+            ],
+            ignore_index=True,
+        )
+        screen_fold_metrics.to_csv(
+            paths["metrics"] / "catboost_experiment_fold_metrics.csv", index=False
+        )
+        if grouped_run is None:
+            raise RuntimeError("Refined training did not produce grouped robustness results.")
+        grouped_summary = pd.concat(
+            [
+                grouped_run["fold_metrics"].assign(
+                    scope="fold", cv_strategy="StratifiedGroupKFold"
+                ),
+                pd.DataFrame(
+                    [
+                        {
+                            "scope": "overall",
+                            "cv_strategy": "StratifiedGroupKFold",
+                            "feature_group_count": grouped_run["feature_group_count"],
+                            **grouped_run["oof_metrics"],
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+            sort=False,
+        )
+        grouped_summary.to_csv(
+            paths["metrics"] / "catboost_grouped_robustness.csv", index=False
+        )
+        pd.DataFrame(
+            {
+                ID_COL: train[ID_COL],
+                TARGET: y,
+                "fold": grouped_run["fold_id"],
+                "fraud_probability_raw": grouped_run["oof_pred"],
+            }
+        ).to_csv(paths["oof"] / "catboost_grouped_robustness_oof.csv", index=False)
 
     oof_output = pd.DataFrame(
         {
@@ -787,6 +882,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         "calibration": calibration_method,
         "calibration_sidecar": calibration_sidecar_method,
         "ensemble_seeds": list(config.ensemble_seeds) if config.profile == "refined" else None,
+        "iteration_diagnostics": {
+            "iteration_cap": int(final_run["params"]["iterations"]),
+            "final_fold_cap_hit_rate": float(final_run["fold_metrics"]["hit_iteration_cap"].mean()),
+        },
         "gpu_status": gpu_status,
         "versions": {
             "python": platform.python_version(),

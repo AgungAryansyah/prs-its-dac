@@ -236,6 +236,12 @@ def _validate_weighting(params: dict[str, Any]) -> None:
         raise ValueError(f"Use only one class-weighting strategy, found: {configured}")
 
 
+def feature_signature_groups(X: pd.DataFrame) -> np.ndarray:
+    if ID_COL in X or TARGET in X:
+        raise ValueError("Feature signatures must not include claim_id or label.")
+    return pd.util.hash_pandas_object(X, index=False).to_numpy(dtype=np.uint64)
+
+
 def train_catboost_cv(
     X: pd.DataFrame,
     y: pd.Series,
@@ -250,6 +256,8 @@ def train_catboost_cv(
     model_prefix: str = "catboost",
     verbose: int | bool = False,
     progress_callback: Callable[[str, int], None] | None = None,
+    groups: np.ndarray | pd.Series | None = None,
+    predict_test: bool = True,
 ) -> dict[str, Any]:
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
@@ -257,6 +265,8 @@ def train_catboost_cv(
         raise ValueError("X and X_test must have the same feature order.")
     if any(column not in X for column in categorical_features):
         raise ValueError("Every categorical feature must exist in X.")
+    if groups is not None and len(groups) != len(X):
+        raise ValueError("groups must have the same length as X.")
 
     model_params = {**BASE_PARAMS, **(params or {})}
     _validate_weighting(model_params)
@@ -272,7 +282,8 @@ def train_catboost_cv(
     if model_dir is not None:
         model_dir.mkdir(parents=True, exist_ok=True)
 
-    for fold, (train_idx, valid_idx) in enumerate(cv.split(X, y)):
+    split_iterator = cv.split(X, y, groups) if groups is not None else cv.split(X, y)
+    for fold, (train_idx, valid_idx) in enumerate(split_iterator):
         if progress_callback is not None:
             progress_callback("start", fold)
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
@@ -289,7 +300,8 @@ def train_catboost_cv(
         valid_pred = model.predict_proba(X_valid)[:, 1]
         oof_pred[valid_idx] = valid_pred
         fold_id[valid_idx] = fold
-        test_fold_predictions.append(model.predict_proba(X_test)[:, 1])
+        if predict_test:
+            test_fold_predictions.append(model.predict_proba(X_test)[:, 1])
         best_iteration = model.get_best_iteration()
         if best_iteration < 0:
             best_iteration = model.tree_count_ - 1
@@ -302,8 +314,23 @@ def train_catboost_cv(
                 "train_fraud_prevalence": float(y_train.mean()),
                 "valid_fraud_prevalence": float(y_valid.mean()),
                 "best_iteration": int(best_iteration + 1),
+                "iteration_cap": int(model_params["iterations"]),
+                "hit_iteration_cap": bool(best_iteration + 1 >= model_params["iterations"]),
             }
         )
+        if groups is not None:
+            train_groups = np.asarray(groups)[train_idx]
+            valid_groups = np.asarray(groups)[valid_idx]
+            overlap_count = len(set(train_groups).intersection(valid_groups))
+            if overlap_count:
+                raise RuntimeError(f"Fold {fold} has {overlap_count} overlapping feature groups.")
+            metrics.update(
+                {
+                    "train_group_count": int(len(np.unique(train_groups))),
+                    "valid_group_count": int(len(np.unique(valid_groups))),
+                    "group_overlap_count": overlap_count,
+                }
+            )
         fold_metrics.append(metrics)
         importance_records.append(
             pd.DataFrame(
@@ -320,11 +347,12 @@ def train_catboost_cv(
         raise RuntimeError("Every training row must receive exactly one OOF prediction.")
     if not np.isfinite(oof_pred).all() or not ((0 <= oof_pred) & (oof_pred <= 1)).all():
         raise RuntimeError("OOF predictions must be finite probabilities.")
-    test_pred = np.mean(np.vstack(test_fold_predictions), axis=0)
+    test_fold_predictions_array = np.vstack(test_fold_predictions) if predict_test else None
+    test_pred = np.mean(test_fold_predictions_array, axis=0) if predict_test else None
     return {
         "oof_pred": oof_pred,
         "test_pred": test_pred,
-        "test_fold_predictions": np.vstack(test_fold_predictions),
+        "test_fold_predictions": test_fold_predictions_array,
         "models": models,
         "fold_metrics": pd.DataFrame(fold_metrics),
         "fold_id": fold_id,
