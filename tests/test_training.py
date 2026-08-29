@@ -134,3 +134,55 @@ def test_refined_profile_uses_isolated_outputs_and_iteration_override(tmp_path, 
     assert (run_dir / "metrics" / "catboost_seed_fold_metrics.csv").exists()
     grouped = pd.read_csv(run_dir / "metrics" / "catboost_grouped_robustness.csv")
     assert {"fold", "overall"} == set(grouped["scope"])
+
+
+def test_ctr_profile_screens_then_confirms_in_an_isolated_run(tmp_path, monkeypatch) -> None:
+    _configure_training_test(tmp_path, monkeypatch)
+    calls = []
+
+    def tracked_train_catboost_cv(*args, **kwargs):
+        calls.append(kwargs["params"]["random_seed"])
+        return _fake_train_catboost_cv(*args, **kwargs)
+
+    monkeypatch.setattr(training, "train_catboost_cv", tracked_train_catboost_cv)
+
+    result = training.run_training(
+        training.TrainingConfig(
+            project_root=tmp_path,
+            task_type="CPU",
+            n_splits=2,
+            profile="ctr",
+            run_name="ctr-check",
+            iterations=12,
+        )
+    )
+
+    run_dir = tmp_path / "outputs" / "runs" / "ctr-check"
+    experiments = pd.read_csv(run_dir / "metrics" / "catboost_experiments.csv")
+    assert result["profile"] == "ctr"
+    assert result["submission_path"] == run_dir / "submissions" / "catboost_submission.csv"
+    assert {
+        "ctr_complexity_1",
+        "ctr_complexity_2",
+        "ctr_complexity_4",
+        "ctr_complexity_6",
+        "ctr_bucket_control",
+        "ctr_dati2_typeppk",
+        "ctr_dati2_cmg",
+        "ctr_kdkc_cmg",
+        "ctr_severitylevel_procedure_count_bucket",
+        "ctr_diagprimer_secondary_diagnosis_count_bucket",
+    } == set(experiments["experiment_name"])
+    assert set(experiments.loc[experiments["experiment_stage"] == "ctr_complexity", "max_ctr_complexity"]) == {
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+    }
+    assert calls[:10] == [42] * 10
+    assert calls[-4:] == [42, 2026, 2718, 42]
+    assert len(calls) == 14
+    assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
+    assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
+    assert (run_dir / "models" / "catboost_final_config.json").exists()
+    assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()

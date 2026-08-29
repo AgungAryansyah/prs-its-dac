@@ -26,13 +26,16 @@ from prs_its.calibration import (
     should_select_calibration,
 )
 from prs_its.fairness import age_groups, fairness_across_budgets
-from prs_its.metrics import audit_metrics, evaluate_probabilities
+from prs_its.metrics import audit_metrics, bootstrap_audit_intervals, evaluate_probabilities
 from prs_its.modeling import (
     BASE_PARAMS,
     ID_COL,
     N_SPLITS,
+    PROCEDURE_COUNT_BUCKET,
     RANDOM_STATE,
+    SECONDARY_DIAGNOSIS_COUNT_BUCKET,
     TARGET,
+    FeatureSpec,
     PreparedFeatures,
     aggregate_feature_importance,
     code_like_dtypes,
@@ -69,6 +72,9 @@ class ExperimentSpec:
     params: dict[str, Any]
     feature_set: str
     notes: str
+    stage: str = "screen"
+    max_ctr_complexity: int | None = None
+    added_interaction: str | None = None
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -83,13 +89,13 @@ def output_paths(
     project_root: Path, profile: str = "baseline", run_name: str | None = None
 ) -> dict[str, Path]:
     output_dir = project_root / "outputs"
-    if profile == "refined":
-        name = run_name or "refined"
+    if profile in {"refined", "ctr"}:
+        name = run_name or profile
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("run_name may contain only letters, numbers, underscores, and hyphens.")
         output_dir = output_dir / "runs" / name
     elif profile != "baseline":
-        raise ValueError("profile must be 'baseline' or 'refined'.")
+        raise ValueError("profile must be 'baseline', 'refined', or 'ctr'.")
     paths = {
         "models": output_dir / "models",
         "oof": output_dir / "oof",
@@ -249,6 +255,93 @@ def _refined_experiment_specs(
     ]
 
 
+CTR_INTERACTION_FEATURES = {
+    "dati2_typeppk": ("dati2", "typeppk"),
+    "dati2_cmg": ("dati2", "cmg"),
+    "kdkc_cmg": ("kdkc", "cmg"),
+    "severitylevel_procedure_count_bucket": ("severitylevel", PROCEDURE_COUNT_BUCKET),
+    "diagprimer_secondary_diagnosis_count_bucket": (
+        "diagprimer",
+        SECONDARY_DIAGNOSIS_COUNT_BUCKET,
+    ),
+}
+
+
+def _deep_combined_params(max_ctr_complexity: int | None = None) -> dict[str, Any]:
+    params = {
+        **BASE_PARAMS,
+        "depth": 8,
+        "l2_leaf_reg": 10.0,
+        "random_strength": 2.0,
+        "bagging_temperature": 1.0,
+    }
+    if max_ctr_complexity is not None:
+        params["max_ctr_complexity"] = max_ctr_complexity
+    return params
+
+
+def _ctr_stage_one_specs(combined_features: PreparedFeatures) -> list[ExperimentSpec]:
+    return [
+        ExperimentSpec(
+            f"ctr_complexity_{complexity}",
+            combined_features,
+            _deep_combined_params(max_ctr_complexity=complexity),
+            "counts_interactions_and_los",
+            "Deep combined features with native CTR complexity screening.",
+            stage="ctr_complexity",
+            max_ctr_complexity=complexity,
+        )
+        for complexity in (1, 2, 4, 6)
+    ]
+
+
+def _ctr_stage_two_specs(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    spec: FeatureSpec,
+    params: dict[str, Any],
+) -> list[ExperimentSpec]:
+    common_kwargs = {
+        "add_count_features": True,
+        "add_interaction_features": True,
+        "add_los_features": True,
+        "add_count_bucket_features": True,
+    }
+    bucket_control = prepare_catboost_features(train, test, spec, **common_kwargs)
+    specs = [
+        ExperimentSpec(
+            "ctr_bucket_control",
+            bucket_control,
+            params.copy(),
+            "counts_interactions_los_and_buckets",
+            "Winning CTR complexity with count bucket control features.",
+            stage="targeted_interaction",
+            max_ctr_complexity=params.get("max_ctr_complexity"),
+        )
+    ]
+    for name, columns in CTR_INTERACTION_FEATURES.items():
+        prepared = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            **common_kwargs,
+            additional_interaction_features={name: columns},
+        )
+        specs.append(
+            ExperimentSpec(
+                f"ctr_{name}",
+                prepared,
+                params.copy(),
+                "counts_interactions_los_buckets_and_targeted_cross",
+                "Winning CTR complexity plus one targeted categorical interaction.",
+                stage="targeted_interaction",
+                max_ctr_complexity=params.get("max_ctr_complexity"),
+                added_interaction=name,
+            )
+        )
+    return specs
+
+
 def _with_iteration_cap(params: dict[str, Any], iterations: int | None) -> dict[str, Any]:
     if iterations is None:
         return params.copy()
@@ -392,6 +485,36 @@ def _select_experiment(results: pd.DataFrame) -> str:
             na_position="last",
         ).iloc[0]["experiment_name"]
     )
+
+
+def _experiment_results_frame(
+    experiment_runs: dict[str, dict[str, Any]], train: pd.DataFrame, y: pd.Series
+) -> pd.DataFrame:
+    rows = []
+    for name, result in experiment_runs.items():
+        fold_metrics = result["fold_metrics"]
+        rows.append(
+            {
+                "experiment_name": name,
+                "experiment_stage": result["experiment_stage"],
+                "feature_set": result["feature_set"],
+                "max_ctr_complexity": result["max_ctr_complexity"],
+                "added_interaction": result["added_interaction"],
+                "params": json.dumps(result["params"], sort_keys=True, default=str),
+                "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
+                "cv_strategy": "StratifiedKFold",
+                **result["oof_metrics"],
+                "mean_best_iteration": fold_metrics["best_iteration"].mean(),
+                "iteration_cap": int(result["params"]["iterations"]),
+                "iteration_cap_hit_rate": fold_metrics["hit_iteration_cap"].mean(),
+                "fold_normalized_recall_5_std": fold_metrics[
+                    "normalized_recall_at_5pct"
+                ].std(),
+                "fairness_audit_rate_gap_5": _fairness_gap(train, y, result["oof_pred"]),
+                "notes": result["notes"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _save_figures(
@@ -550,8 +673,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     task_type = config.task_type.upper()
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
-    if config.profile not in {"baseline", "refined"}:
-        raise ValueError("profile must be 'baseline' or 'refined'.")
+    if config.profile not in {"baseline", "refined", "ctr"}:
+        raise ValueError("profile must be 'baseline', 'refined', or 'ctr'.")
     train, test = load_competition_data(config.project_root)
     paths = output_paths(config.project_root, profile=config.profile, run_name=config.run_name)
     features = validate_train_test_schema(train, test)
@@ -568,7 +691,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
 
     if config.profile == "baseline":
         experiment_specs = _baseline_experiment_specs(baseline, count_features)
-    else:
+        screen_experiment_count = len(experiment_specs)
+    elif config.profile == "refined":
         interaction_features = prepare_catboost_features(
             train,
             test,
@@ -590,13 +714,25 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             interaction_features,
             combined_features,
         )
-    if config.profile == "refined":
+        screen_experiment_count = len(experiment_specs)
+    else:
+        combined_features = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            add_count_features=True,
+            add_interaction_features=True,
+            add_los_features=True,
+        )
+        experiment_specs = _ctr_stage_one_specs(combined_features)
+        screen_experiment_count = len(experiment_specs) + len(CTR_INTERACTION_FEATURES) + 1
+    if config.profile in {"refined", "ctr"}:
         _validate_ensemble_seeds(config.ensemble_seeds)
         final_training_runs = len(config.ensemble_seeds) + 1
     else:
         final_training_runs = 1
     progress = tqdm(
-        total=(len(experiment_specs) + final_training_runs) * config.n_splits,
+        total=(screen_experiment_count + final_training_runs) * config.n_splits,
         desc="CatBoost folds",
         unit="fold",
         disable=not config.show_progress,
@@ -612,59 +748,54 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
 
     experiment_runs: dict[str, dict[str, Any]] = {}
     grouped_run: dict[str, Any] | None = None
-    try:
-        for index, experiment in enumerate(experiment_specs, start=1):
-            name = experiment.name
-            prepared = experiment.prepared
-            params = _with_iteration_cap(experiment.params, config.iterations)
-            progress.set_description(f"Experiment {index}/{len(experiment_specs)}")
-            result = train_catboost_cv(
-                prepared.X,
-                y,
-                prepared.X_test,
-                prepared.categorical_features,
-                cv=cv,
-                params=params,
-                task_type=task_type,
-                devices=config.devices,
-                early_stopping_rounds=config.early_stopping_rounds,
-                verbose=config.catboost_verbose if config.show_progress else False,
-                progress_callback=fold_progress(name),
-            )
-            result.update(
-                {
-                    "experiment_name": name,
-                    "feature_set": experiment.feature_set,
-                    "notes": experiment.notes,
-                    "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
-                    "prepared": prepared,
-                }
-            )
-            result["models"].clear()
-            experiment_runs[name] = result
 
-        experiment_rows = []
-        for name, result in experiment_runs.items():
-            fold_metrics = result["fold_metrics"]
-            experiment_rows.append(
-                {
-                    "experiment_name": name,
-                    "feature_set": result["feature_set"],
-                    "params": json.dumps(result["params"], sort_keys=True, default=str),
-                    "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
-                    "cv_strategy": "StratifiedKFold",
-                    **result["oof_metrics"],
-                    "mean_best_iteration": fold_metrics["best_iteration"].mean(),
-                    "iteration_cap": int(result["params"]["iterations"]),
-                    "iteration_cap_hit_rate": fold_metrics["hit_iteration_cap"].mean(),
-                    "fold_normalized_recall_5_std": fold_metrics[
-                        "normalized_recall_at_5pct"
-                    ].std(),
-                    "fairness_audit_rate_gap_5": _fairness_gap(train, y, result["oof_pred"]),
-                    "notes": result["notes"],
-                }
-            )
-        experiment_results = pd.DataFrame(experiment_rows)
+    def run_experiment(experiment: ExperimentSpec, index: int) -> None:
+        name = experiment.name
+        prepared = experiment.prepared
+        params = _with_iteration_cap(experiment.params, config.iterations)
+        progress.set_description(f"Experiment {index}/{screen_experiment_count}")
+        result = train_catboost_cv(
+            prepared.X,
+            y,
+            prepared.X_test,
+            prepared.categorical_features,
+            cv=cv,
+            params=params,
+            task_type=task_type,
+            devices=config.devices,
+            early_stopping_rounds=config.early_stopping_rounds,
+            verbose=config.catboost_verbose if config.show_progress else False,
+            progress_callback=fold_progress(name),
+        )
+        result.update(
+            {
+                "experiment_name": name,
+                "experiment_stage": experiment.stage,
+                "feature_set": experiment.feature_set,
+                "max_ctr_complexity": experiment.max_ctr_complexity,
+                "added_interaction": experiment.added_interaction,
+                "notes": experiment.notes,
+                "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
+                "prepared": prepared,
+            }
+        )
+        result["models"].clear()
+        experiment_runs[name] = result
+
+    try:
+        if config.profile == "ctr":
+            for index, experiment in enumerate(experiment_specs, start=1):
+                run_experiment(experiment, index)
+            stage_one_results = _experiment_results_frame(experiment_runs, train, y)
+            stage_one_winner = experiment_runs[_select_experiment(stage_one_results)]
+            stage_two_specs = _ctr_stage_two_specs(train, test, spec, stage_one_winner["params"])
+            for index, experiment in enumerate(stage_two_specs, start=len(experiment_specs) + 1):
+                run_experiment(experiment, index)
+        else:
+            for index, experiment in enumerate(experiment_specs, start=1):
+                run_experiment(experiment, index)
+
+        experiment_results = _experiment_results_frame(experiment_runs, train, y)
         experiment_results.to_csv(paths["metrics"] / "catboost_experiments.csv", index=False)
         selected_name = _select_experiment(experiment_results)
         selected = experiment_runs[selected_name]
@@ -733,7 +864,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     ]
     calibration_sidecar_method: str | None = None
     calibration_sidecar_pred: np.ndarray | None = None
-    if config.profile == "refined":
+    if config.profile in {"refined", "ctr"}:
         final_oof_pred = raw_oof_pred
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
@@ -758,7 +889,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
 
-    if config.profile == "refined":
+    if config.profile in {"refined", "ctr"}:
         for seed, seed_run in final_run["seed_runs"].items():
             pd.DataFrame(
                 {
@@ -779,7 +910,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             [
                 result["fold_metrics"].assign(
                     experiment_name=name,
+                    experiment_stage=result["experiment_stage"],
                     feature_set=result["feature_set"],
+                    max_ctr_complexity=result["max_ctr_complexity"],
+                    added_interaction=result["added_interaction"],
                     cv_strategy="StratifiedKFold",
                 )
                 for name, result in experiment_runs.items()
@@ -790,7 +924,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             paths["metrics"] / "catboost_experiment_fold_metrics.csv", index=False
         )
         if grouped_run is None:
-            raise RuntimeError("Refined training did not produce grouped robustness results.")
+            raise RuntimeError("Ensemble training did not produce grouped robustness results.")
         grouped_summary = pd.concat(
             [
                 grouped_run["fold_metrics"].assign(
@@ -821,6 +955,13 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "fraud_probability_raw": grouped_run["oof_pred"],
             }
         ).to_csv(paths["oof"] / "catboost_grouped_robustness_oof.csv", index=False)
+        if config.profile == "ctr":
+            pd.DataFrame(bootstrap_audit_intervals(y, final_run["oof_pred"])).to_csv(
+                paths["metrics"] / "catboost_audit_bootstrap.csv", index=False
+            )
+            pd.DataFrame(bootstrap_audit_intervals(y, grouped_run["oof_pred"])).to_csv(
+                paths["metrics"] / "catboost_grouped_robustness_bootstrap.csv", index=False
+            )
 
     oof_output = pd.DataFrame(
         {
@@ -877,6 +1018,12 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         "categorical_features": selected["prepared"].categorical_features,
         "excluded_features": [ID_COL],
         "params": final_run["params"],
+        "experiment": {
+            "name": selected_name,
+            "stage": selected["experiment_stage"],
+            "max_ctr_complexity": selected["max_ctr_complexity"],
+            "added_interaction": selected["added_interaction"],
+        },
         "cv": {
             "type": "StratifiedKFold",
             "n_splits": config.n_splits,
@@ -885,7 +1032,9 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         },
         "calibration": calibration_method,
         "calibration_sidecar": calibration_sidecar_method,
-        "ensemble_seeds": list(config.ensemble_seeds) if config.profile == "refined" else None,
+        "ensemble_seeds": (
+            list(config.ensemble_seeds) if config.profile in {"refined", "ctr"} else None
+        ),
         "iteration_diagnostics": {
             "iteration_cap": int(final_run["params"]["iterations"]),
             "final_fold_cap_hit_rate": float(final_run["fold_metrics"]["hit_iteration_cap"].mean()),
@@ -922,7 +1071,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "Decision": calibration_method,
                 "Reason": (
                     "Raw probabilities preserve the audit ranking."
-                    if config.profile == "refined"
+                    if config.profile in {"refined", "ctr"}
                     else "Calibration must improve Brier without unacceptable ranking loss."
                 ),
             },
@@ -957,7 +1106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default=os.environ.get("PRS_ITS_GPU_DEVICES", "0"))
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--catboost-verbose", type=int, default=100)
-    parser.add_argument("--profile", choices=["baseline", "refined"], default="baseline")
+    parser.add_argument("--profile", choices=["baseline", "refined", "ctr"], default="baseline")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--ensemble-seeds", default="42,2026,2718")
