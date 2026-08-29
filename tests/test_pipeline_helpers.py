@@ -9,6 +9,8 @@ from prs_its.calibration import calibrate_test_predictions, cross_fit_calibratio
 from prs_its.fairness import age_groups, fairness_audit_rates
 from prs_its.modeling import (
     CATEGORICAL_CANDIDATES,
+    PROCEDURE_COUNT_BUCKET,
+    SECONDARY_DIAGNOSIS_COUNT_BUCKET,
     feature_signature_groups,
     make_feature_spec,
     prepare_catboost_features,
@@ -76,6 +78,47 @@ def test_refined_feature_preparation_adds_consistent_categorical_features() -> N
     assert prepared.X.loc[0, "los_bucket"] == "0"
     assert prepared.X.loc[0, "los_zero_indicator"] == 1
     assert "claim_id" not in prepared.X
+
+
+def test_targeted_interactions_and_count_buckets_are_categorical() -> None:
+    train, test = _datasets()
+    train.loc[0, "dati2"] = pd.NA
+    test.loc[0, "dati2"] = pd.NA
+    spec = make_feature_spec(train, test)
+    prepared = prepare_catboost_features(
+        train,
+        test,
+        spec,
+        add_count_features=True,
+        add_count_bucket_features=True,
+        additional_interaction_features={
+            "dati2_typeppk": ("dati2", "typeppk"),
+            "severitylevel_procedure_count_bucket": ("severitylevel", PROCEDURE_COUNT_BUCKET),
+        },
+    )
+
+    expected = {
+        SECONDARY_DIAGNOSIS_COUNT_BUCKET,
+        PROCEDURE_COUNT_BUCKET,
+        "dati2_typeppk",
+        "severitylevel_procedure_count_bucket",
+    }
+    assert expected <= set(prepared.categorical_features)
+    assert expected <= set(prepared.X)
+    assert prepared.X.loc[0, SECONDARY_DIAGNOSIS_COUNT_BUCKET] == "0"
+    assert prepared.X.loc[2, SECONDARY_DIAGNOSIS_COUNT_BUCKET] == "2"
+    assert prepared.X.loc[0, PROCEDURE_COUNT_BUCKET] == "0"
+    assert prepared.X.loc[1, PROCEDURE_COUNT_BUCKET] == "1"
+    assert prepared.X.loc[0, "dati2_typeppk"].startswith("__MISSING__")
+    assert list(prepared.X.columns) == list(prepared.X_test.columns)
+
+
+def test_count_buckets_require_count_features() -> None:
+    train, test = _datasets()
+    spec = make_feature_spec(train, test)
+
+    with pytest.raises(ValueError, match="require"):
+        prepare_catboost_features(train, test, spec, add_count_bucket_features=True)
 
 
 def test_schema_validation_rejects_mismatched_order() -> None:

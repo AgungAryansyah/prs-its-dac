@@ -32,6 +32,8 @@ INTERACTION_FEATURES = {
     "cmg_severitylevel": ("cmg", "severitylevel"),
     "diagprimer_cmg": ("diagprimer", "cmg"),
 }
+SECONDARY_DIAGNOSIS_COUNT_BUCKET = "secondary_diagnosis_count_bucket"
+PROCEDURE_COUNT_BUCKET = "procedure_count_bucket"
 BASE_PARAMS = {
     "loss_function": "Logloss",
     "eval_metric": "PRAUC",
@@ -138,6 +140,8 @@ def prepare_catboost_features(
     add_count_features: bool = False,
     add_interaction_features: bool = False,
     add_los_features: bool = False,
+    add_count_bucket_features: bool = False,
+    additional_interaction_features: dict[str, tuple[str, ...]] | None = None,
 ) -> PreparedFeatures:
     X = train.loc[:, spec.features].copy()
     X_test = test.loc[:, spec.features].copy()
@@ -147,6 +151,9 @@ def prepare_catboost_features(
         X[column] = X[column].astype("string").fillna("__MISSING__").astype(str)
         X_test[column] = X_test[column].astype("string").fillna("__MISSING__").astype(str)
     categorical_features = list(spec.categorical_features)
+
+    if add_count_bucket_features and not add_count_features:
+        raise ValueError("Count bucket features require add_count_features=True.")
 
     if add_count_features:
         diagnosis_columns = [column for column in spec.features if column.startswith("dx2_")]
@@ -164,11 +171,53 @@ def prepare_catboost_features(
             pd.to_numeric, errors="coerce"
         ).sum(axis=1, min_count=1)
 
+    if add_count_bucket_features:
+        for frame in (X, X_test):
+            frame[SECONDARY_DIAGNOSIS_COUNT_BUCKET] = (
+                pd.cut(
+                    frame["secondary_diagnosis_count"],
+                    bins=[-np.inf, 0, 1, 2, np.inf],
+                    labels=["0", "1", "2", "3+"],
+                    include_lowest=True,
+                )
+                .astype("string")
+                .fillna("__MISSING__")
+                .astype(str)
+            )
+            frame[PROCEDURE_COUNT_BUCKET] = (
+                pd.cut(
+                    frame["procedure_count"],
+                    bins=[-np.inf, 0, 1, 2, 3, np.inf],
+                    labels=["0", "1", "2", "3", "4+"],
+                    include_lowest=True,
+                )
+                .astype("string")
+                .fillna("__MISSING__")
+                .astype(str)
+            )
+        categorical_features.extend(
+            [SECONDARY_DIAGNOSIS_COUNT_BUCKET, PROCEDURE_COUNT_BUCKET]
+        )
+
+    interaction_features = {}
     if add_interaction_features:
-        for name, columns in INTERACTION_FEATURES.items():
-            X[name] = X.loc[:, columns].agg("__".join, axis=1)
-            X_test[name] = X_test.loc[:, columns].agg("__".join, axis=1)
-            categorical_features.append(name)
+        interaction_features.update(INTERACTION_FEATURES)
+    if additional_interaction_features:
+        interaction_features.update(additional_interaction_features)
+    for name, columns in interaction_features.items():
+        if name in X:
+            raise ValueError(f"Interaction feature already exists: {name}.")
+        if any(column not in X for column in columns):
+            raise ValueError(f"Interaction {name!r} references an unavailable feature.")
+        for frame in (X, X_test):
+            frame[name] = (
+                frame.loc[:, list(columns)]
+                .astype("string")
+                .fillna("__MISSING__")
+                .agg("__".join, axis=1)
+                .astype(str)
+            )
+        categorical_features.append(name)
 
     if add_los_features:
         for frame in (X, X_test):
