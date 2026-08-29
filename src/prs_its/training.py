@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 from typing import Any
 
 import catboost
@@ -54,6 +55,18 @@ class TrainingConfig:
     early_stopping_rounds: int = 200
     show_progress: bool = True
     catboost_verbose: int = 100
+    profile: str = "baseline"
+    run_name: str | None = None
+    iterations: int | None = None
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    name: str
+    prepared: PreparedFeatures
+    params: dict[str, Any]
+    feature_set: str
+    notes: str
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -64,8 +77,17 @@ def find_project_root(start: Path | None = None) -> Path:
     raise FileNotFoundError("Could not locate pyproject.toml.")
 
 
-def output_paths(project_root: Path) -> dict[str, Path]:
+def output_paths(
+    project_root: Path, profile: str = "baseline", run_name: str | None = None
+) -> dict[str, Path]:
     output_dir = project_root / "outputs"
+    if profile == "refined":
+        name = run_name or "refined"
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError("run_name may contain only letters, numbers, underscores, and hyphens.")
+        output_dir = output_dir / "runs" / name
+    elif profile != "baseline":
+        raise ValueError("profile must be 'baseline' or 'refined'.")
     paths = {
         "models": output_dir / "models",
         "oof": output_dir / "oof",
@@ -91,24 +113,32 @@ def load_competition_data(project_root: Path) -> tuple[pd.DataFrame, pd.DataFram
     return train, test
 
 
-def _experiment_specs(
+def _baseline_experiment_specs(
     baseline: PreparedFeatures, count_features: PreparedFeatures
-) -> list[tuple[str, PreparedFeatures, dict[str, Any], str]]:
+) -> list[ExperimentSpec]:
     return [
-        ("unweighted_baseline", baseline, BASE_PARAMS.copy(), "Original features; no class weighting."),
-        (
+        ExperimentSpec(
+            "unweighted_baseline",
+            baseline,
+            BASE_PARAMS.copy(),
+            "original",
+            "Original features; no class weighting.",
+        ),
+        ExperimentSpec(
             "balanced_baseline",
             baseline,
             {**BASE_PARAMS, "auto_class_weights": "Balanced"},
+            "original",
             "Original features; CatBoost balanced weights.",
         ),
-        (
+        ExperimentSpec(
             "count_features",
             count_features,
             BASE_PARAMS.copy(),
+            "count_features",
             "Original features plus diagnosis and procedure counts.",
         ),
-        (
+        ExperimentSpec(
             "shallow_regularized",
             baseline,
             {
@@ -118,9 +148,10 @@ def _experiment_specs(
                 "random_strength": 0.5,
                 "bagging_temperature": 0.5,
             },
+            "original",
             "Targeted shallow regularization.",
         ),
-        (
+        ExperimentSpec(
             "deep_regularized",
             baseline,
             {
@@ -130,9 +161,98 @@ def _experiment_specs(
                 "random_strength": 2.0,
                 "bagging_temperature": 1.0,
             },
+            "original",
             "Targeted deeper regularization.",
         ),
     ]
+
+
+def _refined_experiment_specs(
+    baseline: PreparedFeatures,
+    count_features: PreparedFeatures,
+    interaction_features: PreparedFeatures,
+    combined_features: PreparedFeatures,
+) -> list[ExperimentSpec]:
+    deep_params = {
+        **BASE_PARAMS,
+        "depth": 8,
+        "l2_leaf_reg": 10.0,
+        "random_strength": 2.0,
+        "bagging_temperature": 1.0,
+    }
+    return [
+        ExperimentSpec(
+            "deep_regularized_control",
+            baseline,
+            deep_params,
+            "original",
+            "Current deep regularized configuration.",
+        ),
+        ExperimentSpec(
+            "deep_count_features",
+            count_features,
+            deep_params,
+            "count_features",
+            "Deep configuration plus diagnosis and procedure counts.",
+        ),
+        ExperimentSpec(
+            "deep_interaction_features",
+            interaction_features,
+            deep_params,
+            "interactions_and_los",
+            "Deep configuration plus categorical interactions and LOS features.",
+        ),
+        ExperimentSpec(
+            "deep_combined_features",
+            combined_features,
+            deep_params,
+            "counts_interactions_and_los",
+            "Deep configuration plus count, interaction, and LOS features.",
+        ),
+        ExperimentSpec(
+            "deep_depth_7",
+            baseline,
+            {**deep_params, "depth": 7},
+            "original",
+            "Targeted shallower deep-model variant.",
+        ),
+        ExperimentSpec(
+            "deep_depth_9",
+            baseline,
+            {**deep_params, "depth": 9},
+            "original",
+            "Targeted deeper-model variant.",
+        ),
+        ExperimentSpec(
+            "deep_l2_20",
+            baseline,
+            {**deep_params, "l2_leaf_reg": 20.0},
+            "original",
+            "Stronger L2 regularization.",
+        ),
+        ExperimentSpec(
+            "deep_random_strength_1",
+            baseline,
+            {**deep_params, "random_strength": 1.0},
+            "original",
+            "Reduced split-score randomness.",
+        ),
+        ExperimentSpec(
+            "deep_bagging_temperature_0_5",
+            baseline,
+            {**deep_params, "bagging_temperature": 0.5},
+            "original",
+            "Reduced Bayesian bootstrap temperature.",
+        ),
+    ]
+
+
+def _with_iteration_cap(params: dict[str, Any], iterations: int | None) -> dict[str, Any]:
+    if iterations is None:
+        return params.copy()
+    if iterations <= 0:
+        raise ValueError("iterations must be positive.")
+    return {**params, "iterations": iterations}
 
 
 def _fairness_gap(train: pd.DataFrame, y: pd.Series, probabilities: np.ndarray) -> float:
@@ -194,6 +314,8 @@ def _save_figures(
     plt.figure(figsize=(6, 6))
     plt.plot([0, 1], [0, 1], linestyle="--", color="black", label="ideal")
     for name in ["unweighted_baseline", "balanced_baseline"]:
+        if name not in experiment_runs:
+            continue
         curve = calibration_curve_frame(y, experiment_runs[name]["oof_pred"])
         plt.plot(
             curve["mean_predicted_probability"],
@@ -201,12 +323,13 @@ def _save_figures(
             marker="o",
             label=name,
         )
-    plt.xlabel("Mean predicted probability")
-    plt.ylabel("Observed fraud rate")
-    plt.legend()
-    plt.title("Class-Weighting Calibration Comparison")
-    plt.tight_layout()
-    plt.savefig(figure_dir / "class_weighting_calibration.png", dpi=160)
+    if {"unweighted_baseline", "balanced_baseline"} <= experiment_runs.keys():
+        plt.xlabel("Mean predicted probability")
+        plt.ylabel("Observed fraud rate")
+        plt.legend()
+        plt.title("Class-Weighting Calibration Comparison")
+        plt.tight_layout()
+        plt.savefig(figure_dir / "class_weighting_calibration.png", dpi=160)
     plt.close()
 
     robustness = pd.DataFrame(
@@ -326,8 +449,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     task_type = config.task_type.upper()
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
+    if config.profile not in {"baseline", "refined"}:
+        raise ValueError("profile must be 'baseline' or 'refined'.")
     train, test = load_competition_data(config.project_root)
-    paths = output_paths(config.project_root)
+    paths = output_paths(config.project_root, profile=config.profile, run_name=config.run_name)
     features = validate_train_test_schema(train, test)
     if ID_COL in features or TARGET in features:
         raise RuntimeError("claim_id and label must not be model features.")
@@ -340,7 +465,30 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     )
     gpu_status = ensure_gpu_ready(config.devices) if task_type == "GPU" else "CPU explicitly selected"
 
-    experiment_specs = _experiment_specs(baseline, count_features)
+    if config.profile == "baseline":
+        experiment_specs = _baseline_experiment_specs(baseline, count_features)
+    else:
+        interaction_features = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            add_interaction_features=True,
+            add_los_features=True,
+        )
+        combined_features = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            add_count_features=True,
+            add_interaction_features=True,
+            add_los_features=True,
+        )
+        experiment_specs = _refined_experiment_specs(
+            baseline,
+            count_features,
+            interaction_features,
+            combined_features,
+        )
     progress = tqdm(
         total=(len(experiment_specs) + 1) * config.n_splits,
         desc="CatBoost folds",
@@ -358,13 +506,16 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
 
     experiment_runs: dict[str, dict[str, Any]] = {}
     try:
-        for index, (name, prepared, params, notes) in enumerate(experiment_specs, start=1):
+        for index, experiment in enumerate(experiment_specs, start=1):
+            name = experiment.name
+            prepared = experiment.prepared
+            params = _with_iteration_cap(experiment.params, config.iterations)
             progress.set_description(f"Experiment {index}/{len(experiment_specs)}")
             result = train_catboost_cv(
                 prepared.X,
                 y,
                 prepared.X_test,
-                spec.categorical_features,
+                prepared.categorical_features,
                 cv=cv,
                 params=params,
                 task_type=task_type,
@@ -376,7 +527,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             result.update(
                 {
                     "experiment_name": name,
-                    "notes": notes,
+                    "feature_set": experiment.feature_set,
+                    "notes": experiment.notes,
                     "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
                     "prepared": prepared,
                 }
@@ -390,7 +542,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             experiment_rows.append(
                 {
                     "experiment_name": name,
-                    "feature_set": "count_features" if name == "count_features" else "original",
+                    "feature_set": result["feature_set"],
                     "params": json.dumps(result["params"], sort_keys=True, default=str),
                     "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
                     "cv_strategy": "StratifiedKFold",
@@ -412,7 +564,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             selected["prepared"].X,
             y,
             selected["prepared"].X_test,
-            spec.categorical_features,
+            selected["prepared"].categorical_features,
             cv=cv,
             params=selected["params"],
             task_type=task_type,
@@ -493,13 +645,15 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         selected["prepared"],
         final_run,
         final_oof_pred,
-        spec.categorical_features,
+        selected["prepared"].categorical_features,
     )
 
     final_config = {
         "model": "CatBoostClassifier",
+        "profile": config.profile,
+        "run_name": config.run_name,
         "features": list(selected["prepared"].X.columns),
-        "categorical_features": spec.categorical_features,
+        "categorical_features": selected["prepared"].categorical_features,
         "excluded_features": [ID_COL],
         "params": final_run["params"],
         "cv": {
@@ -547,6 +701,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     )
     findings.to_csv(paths["metrics"] / "catboost_final_findings.csv", index=False)
     return {
+        "profile": config.profile,
         "selected_experiment": selected_name,
         "calibration_method": calibration_method,
         "metrics": final_metrics,
@@ -558,10 +713,17 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the NHPA CatBoost fraud-risk model.")
     parser.add_argument("--project-root", type=Path, default=None)
-    parser.add_argument("--task-type", choices=["CPU", "GPU"], default=os.environ.get("PRS_ITS_TASK_TYPE", "GPU").upper())
+    parser.add_argument(
+        "--task-type",
+        choices=["CPU", "GPU"],
+        default=os.environ.get("PRS_ITS_TASK_TYPE", "GPU").upper(),
+    )
     parser.add_argument("--devices", default=os.environ.get("PRS_ITS_GPU_DEVICES", "0"))
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--catboost-verbose", type=int, default=100)
+    parser.add_argument("--profile", choices=["baseline", "refined"], default="baseline")
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--iterations", type=int, default=None)
     return parser.parse_args()
 
 
@@ -573,6 +735,9 @@ def main() -> None:
         devices=args.devices,
         show_progress=not args.quiet,
         catboost_verbose=args.catboost_verbose,
+        profile=args.profile,
+        run_name=args.run_name,
+        iterations=args.iterations,
     )
     result = run_training(config)
     print(json.dumps(result, default=str, indent=2))
