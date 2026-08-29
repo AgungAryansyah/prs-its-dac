@@ -352,6 +352,7 @@ def _run_grouped_robustness(
     )
     result["oof_metrics"] = evaluate_probabilities(y, result["oof_pred"])
     result["feature_group_count"] = int(len(np.unique(groups)))
+    result["models"].clear()
     return result
 
 
