@@ -405,6 +405,7 @@ def train_catboost_cv(
     progress_callback: Callable[[str, int], None] | None = None,
     groups: np.ndarray | pd.Series | None = None,
     predict_test: bool = True,
+    fold_transformer_factory: Callable[[], FrequencyFeatureTransformer] | None = None,
 ) -> dict[str, Any]:
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
@@ -425,6 +426,10 @@ def train_catboost_cv(
     fold_metrics: list[dict[str, Any]] = []
     importance_records: list[pd.DataFrame] = []
     models: list[CatBoostClassifier] = []
+    fold_transformers: list[FrequencyFeatureTransformer] | None = (
+        [] if fold_transformer_factory is not None else None
+    )
+    model_features: list[str] | None = None
 
     if model_dir is not None:
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -435,20 +440,38 @@ def train_catboost_cv(
             progress_callback("start", fold)
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+        if fold_transformer_factory is None:
+            X_train_model = X_train
+            X_valid_model = X_valid
+            X_test_model = X_test if predict_test else None
+        else:
+            transformer = fold_transformer_factory().fit(X_train)
+            X_train_model = transformer.transform(X_train)
+            X_valid_model = transformer.transform(X_valid)
+            X_test_model = transformer.transform(X_test) if predict_test else None
+            if model_dir is not None:
+                transformer.save(model_dir / f"{model_prefix}_frequency_fold_{fold}.json")
+            fold_transformers.append(transformer)
+        if model_features is None:
+            model_features = list(X_train_model.columns)
+        if list(X_train_model.columns) != list(X_valid_model.columns):
+            raise RuntimeError("Fold feature transformer produced mismatched train and validation schemas.")
+        if X_test_model is not None and list(X_train_model.columns) != list(X_test_model.columns):
+            raise RuntimeError("Fold feature transformer produced mismatched train and test schemas.")
         model = CatBoostClassifier(**model_params)
         model.fit(
-            X_train,
+            X_train_model,
             y_train,
             cat_features=categorical_features,
-            eval_set=(X_valid, y_valid),
+            eval_set=(X_valid_model, y_valid),
             early_stopping_rounds=early_stopping_rounds,
             verbose=verbose,
         )
-        valid_pred = model.predict_proba(X_valid)[:, 1]
+        valid_pred = model.predict_proba(X_valid_model)[:, 1]
         oof_pred[valid_idx] = valid_pred
         fold_id[valid_idx] = fold
         if predict_test:
-            test_fold_predictions.append(model.predict_proba(X_test)[:, 1])
+            test_fold_predictions.append(model.predict_proba(X_test_model)[:, 1])
         best_iteration = model.get_best_iteration()
         if best_iteration < 0:
             best_iteration = model.tree_count_ - 1
@@ -481,7 +504,11 @@ def train_catboost_cv(
         fold_metrics.append(metrics)
         importance_records.append(
             pd.DataFrame(
-                {"feature": X.columns, "importance": model.get_feature_importance(), "fold": fold}
+                {
+                    "feature": X_train_model.columns,
+                    "importance": model.get_feature_importance(),
+                    "fold": fold,
+                }
             )
         )
         if model_dir is not None:
@@ -504,6 +531,8 @@ def train_catboost_cv(
         "fold_metrics": pd.DataFrame(fold_metrics),
         "fold_id": fold_id,
         "feature_importance": pd.concat(importance_records, ignore_index=True),
+        "model_features": model_features or list(X.columns),
+        "fold_transformers": fold_transformers,
         "params": model_params,
     }
 

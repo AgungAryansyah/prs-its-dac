@@ -182,6 +182,29 @@ def test_cpu_cv_produces_complete_oof_and_fold_models(tmp_path) -> None:
     assert progress_events == [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
 
 
+def test_cpu_cv_applies_and_saves_fold_frequency_transformers(tmp_path) -> None:
+    train, test = _datasets()
+    spec = make_feature_spec(train, test)
+    prepared = prepare_catboost_features(train, test, spec)
+    result = train_catboost_cv(
+        prepared.X,
+        prepared.y,
+        prepared.X_test,
+        prepared.categorical_features,
+        cv=StratifiedKFold(n_splits=2, shuffle=True, random_state=42),
+        params={"iterations": 10, "depth": 2, "learning_rate": 0.1},
+        task_type="CPU",
+        early_stopping_rounds=3,
+        model_dir=tmp_path,
+        fold_transformer_factory=lambda: FrequencyFeatureTransformer(("dati2",), mode="count"),
+    )
+
+    assert result["fold_transformers"] is not None
+    assert len(result["fold_transformers"]) == 2
+    assert "frequency_count_dati2" in result["model_features"]
+    assert len(list(tmp_path.glob("catboost_frequency_fold_*.json"))) == 2
+
+
 def test_feature_signature_groups_keep_duplicate_rows_in_one_validation_fold() -> None:
     train, test = _datasets()
     duplicated = pd.concat([train.iloc[:2], train.iloc[:2], train.iloc[2:]], ignore_index=True)
