@@ -9,6 +9,7 @@ from prs_its.calibration import calibrate_test_predictions, cross_fit_calibratio
 from prs_its.fairness import age_groups, fairness_audit_rates
 from prs_its.modeling import (
     CATEGORICAL_CANDIDATES,
+    FrequencyFeatureTransformer,
     PROCEDURE_COUNT_BUCKET,
     SECONDARY_DIAGNOSIS_COUNT_BUCKET,
     feature_signature_groups,
@@ -119,6 +120,30 @@ def test_count_buckets_require_count_features() -> None:
 
     with pytest.raises(ValueError, match="require"):
         prepare_catboost_features(train, test, spec, add_count_bucket_features=True)
+
+
+def test_frequency_transformer_uses_training_counts_and_round_trips(tmp_path) -> None:
+    training = pd.DataFrame({"category": ["A", "A", "B"]})
+    validation = pd.DataFrame({"category": ["A", "B", "C", pd.NA]})
+    transformer = FrequencyFeatureTransformer(("category",), mode="count").fit(training)
+
+    transformed = transformer.transform(validation)
+    assert transformed["frequency_count_category"].tolist() == [2.0, 1.0, 0.0, 0.0]
+
+    path = tmp_path / "frequency.json"
+    transformer.save(path)
+    loaded = FrequencyFeatureTransformer.load(path)
+    assert loaded.transform(validation).equals(transformed)
+
+
+def test_frequency_transformer_marks_unseen_values_as_rare() -> None:
+    training = pd.DataFrame({"category": ["A", "A", "B"]})
+    validation = pd.DataFrame({"category": ["A", "B", "C"]})
+    transformer = FrequencyFeatureTransformer(
+        ("category",), mode="rare_flag", rare_threshold=1
+    ).fit(training)
+
+    assert transformer.transform(validation)["frequency_rare_category"].tolist() == [0, 1, 1]
 
 
 def test_schema_validation_rejects_mismatched_order() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 import subprocess
 from typing import Any, Callable, Iterable
@@ -34,6 +35,16 @@ INTERACTION_FEATURES = {
 }
 SECONDARY_DIAGNOSIS_COUNT_BUCKET = "secondary_diagnosis_count_bucket"
 PROCEDURE_COUNT_BUCKET = "procedure_count_bucket"
+FREQUENCY_SOURCE_FEATURES = (
+    "dati2",
+    "kdkc",
+    "typeppk",
+    "cmg",
+    "diagprimer",
+    "dati2_typeppk",
+)
+FREQUENCY_RARE_SOURCE_FEATURES = ("dati2", "cmg", "diagprimer", "dati2_typeppk")
+FREQUENCY_RARE_THRESHOLD = 25
 BASE_PARAMS = {
     "loss_function": "Logloss",
     "eval_metric": "PRAUC",
@@ -67,6 +78,93 @@ class PreparedFeatures:
     X_test: pd.DataFrame
     spec: FeatureSpec
     categorical_features: list[str]
+
+
+@dataclass
+class FrequencyFeatureTransformer:
+    source_features: tuple[str, ...]
+    mode: str
+    rare_threshold: int = FREQUENCY_RARE_THRESHOLD
+    frequency_maps: dict[str, dict[str, int]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"count", "log_count", "rare_flag"}:
+            raise ValueError("mode must be 'count', 'log_count', or 'rare_flag'.")
+        if not self.source_features:
+            raise ValueError("source_features must not be empty.")
+        if self.rare_threshold < 0:
+            raise ValueError("rare_threshold must be non-negative.")
+
+    @property
+    def output_features(self) -> list[str]:
+        prefix = {
+            "count": "frequency_count",
+            "log_count": "frequency_log_count",
+            "rare_flag": "frequency_rare",
+        }[self.mode]
+        return [f"{prefix}_{feature}" for feature in self.source_features]
+
+    def fit(self, X: pd.DataFrame) -> FrequencyFeatureTransformer:
+        self._validate_source_features(X)
+        self.frequency_maps = {
+            feature: self._feature_values(X[feature]).value_counts().astype(int).to_dict()
+            for feature in self.source_features
+        }
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if self.frequency_maps is None:
+            raise RuntimeError("FrequencyFeatureTransformer must be fitted before transform.")
+        self._validate_source_features(X)
+        transformed = X.copy()
+        for source_feature, output_feature in zip(self.source_features, self.output_features, strict=True):
+            counts = self._feature_values(X[source_feature]).map(
+                self.frequency_maps[source_feature]
+            ).fillna(0.0)
+            if self.mode == "count":
+                transformed[output_feature] = counts.astype(float)
+            elif self.mode == "log_count":
+                transformed[output_feature] = np.log1p(counts).astype(float)
+            else:
+                transformed[output_feature] = (counts <= self.rare_threshold).astype(int)
+        return transformed
+
+    def as_dict(self) -> dict[str, Any]:
+        if self.frequency_maps is None:
+            raise RuntimeError("FrequencyFeatureTransformer must be fitted before serialization.")
+        return {
+            "source_features": list(self.source_features),
+            "mode": self.mode,
+            "rare_threshold": self.rare_threshold,
+            "frequency_maps": self.frequency_maps,
+        }
+
+    def save(self, path: Path) -> None:
+        with path.open("w") as file:
+            json.dump(self.as_dict(), file, indent=2, sort_keys=True)
+
+    @classmethod
+    def load(cls, path: Path) -> FrequencyFeatureTransformer:
+        with path.open() as file:
+            payload = json.load(file)
+        return cls(
+            source_features=tuple(payload["source_features"]),
+            mode=payload["mode"],
+            rare_threshold=int(payload["rare_threshold"]),
+            frequency_maps={
+                feature: {value: int(count) for value, count in counts.items()}
+                for feature, counts in payload["frequency_maps"].items()
+            },
+        )
+
+    @staticmethod
+    def _feature_values(values: pd.Series) -> pd.Series:
+        return values.astype("string").fillna("__MISSING__").astype(str)
+
+    def _validate_source_features(self, X: pd.DataFrame) -> None:
+        missing = [feature for feature in self.source_features if feature not in X]
+        if missing:
+            raise ValueError(f"Frequency source features are unavailable: {missing}")
 
 
 def code_like_dtypes(columns: Iterable[str] = CATEGORICAL_CANDIDATES) -> dict[str, str]:
