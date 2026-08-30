@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import platform
 import re
-from typing import Any
+from typing import Any, Callable
 
 import catboost
 import matplotlib.pyplot as plt
@@ -36,6 +36,10 @@ from prs_its.modeling import (
     SECONDARY_DIAGNOSIS_COUNT_BUCKET,
     TARGET,
     FeatureSpec,
+    FREQUENCY_RARE_SOURCE_FEATURES,
+    FREQUENCY_RARE_THRESHOLD,
+    FREQUENCY_SOURCE_FEATURES,
+    FrequencyFeatureTransformer,
     PreparedFeatures,
     aggregate_feature_importance,
     code_like_dtypes,
@@ -75,6 +79,7 @@ class ExperimentSpec:
     stage: str = "screen"
     max_ctr_complexity: int | None = None
     added_interaction: str | None = None
+    fold_transformer_factory: Callable[[], FrequencyFeatureTransformer] | None = None
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -89,13 +94,13 @@ def output_paths(
     project_root: Path, profile: str = "baseline", run_name: str | None = None
 ) -> dict[str, Path]:
     output_dir = project_root / "outputs"
-    if profile in {"refined", "ctr"}:
+    if profile in {"refined", "ctr", "frequency"}:
         name = run_name or profile
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("run_name may contain only letters, numbers, underscores, and hyphens.")
         output_dir = output_dir / "runs" / name
     elif profile != "baseline":
-        raise ValueError("profile must be 'baseline', 'refined', or 'ctr'.")
+        raise ValueError("profile must be 'baseline', 'refined', 'ctr', or 'frequency'.")
     paths = {
         "models": output_dir / "models",
         "oof": output_dir / "oof",
@@ -342,6 +347,47 @@ def _ctr_stage_two_specs(
     return specs
 
 
+def _frequency_experiment_specs(
+    frequency_base: PreparedFeatures,
+) -> list[ExperimentSpec]:
+    params = _deep_combined_params(max_ctr_complexity=4)
+    specs = [
+        ExperimentSpec(
+            "frequency_control",
+            frequency_base,
+            params.copy(),
+            "ctr_incumbent",
+            "Winning CTR configuration without frequency features.",
+            stage="frequency",
+            max_ctr_complexity=4,
+            added_interaction="dati2_typeppk",
+        )
+    ]
+    for mode, source_features in (
+        ("count", FREQUENCY_SOURCE_FEATURES),
+        ("log_count", FREQUENCY_SOURCE_FEATURES),
+        ("rare_flag", FREQUENCY_RARE_SOURCE_FEATURES),
+    ):
+        specs.append(
+            ExperimentSpec(
+                f"frequency_{mode}",
+                frequency_base,
+                params.copy(),
+                f"ctr_incumbent_and_frequency_{mode}",
+                "Winning CTR configuration plus fold-fitted frequency features.",
+                stage="frequency",
+                max_ctr_complexity=4,
+                added_interaction="dati2_typeppk",
+                fold_transformer_factory=(
+                    lambda mode=mode, source_features=source_features: FrequencyFeatureTransformer(
+                        tuple(source_features), mode, FREQUENCY_RARE_THRESHOLD
+                    )
+                ),
+            )
+        )
+    return specs
+
+
 def _with_iteration_cap(params: dict[str, Any], iterations: int | None) -> dict[str, Any]:
     if iterations is None:
         return params.copy()
@@ -395,6 +441,8 @@ def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> di
     for seed, run in seed_runs.items():
         if seed != first_seed:
             run["models"].clear()
+            if run["fold_transformers"] is not None:
+                run["fold_transformers"].clear()
     return {
         "oof_pred": oof_pred,
         "test_pred": test_pred,
@@ -407,6 +455,8 @@ def _combine_seed_runs(seed_runs: dict[int, dict[str, Any]], y: pd.Series) -> di
         "feature_importance": pd.concat(
             [run["feature_importance"] for run in seed_runs.values()], ignore_index=True
         ),
+        "model_features": first_run["model_features"],
+        "fold_transformers": first_run["fold_transformers"],
         "params": first_run["params"],
         "seed_runs": seed_runs,
         "seed_fold_metrics": seed_fold_metrics,
@@ -421,6 +471,7 @@ def _run_grouped_robustness(
     config: TrainingConfig,
     task_type: str,
     progress_callback: Any,
+    fold_transformer_factory: Callable[[], FrequencyFeatureTransformer] | None = None,
 ) -> dict[str, Any]:
     groups = feature_signature_groups(prepared.X)
     cv = StratifiedGroupKFold(
@@ -442,10 +493,13 @@ def _run_grouped_robustness(
         progress_callback=progress_callback,
         groups=groups,
         predict_test=False,
+        fold_transformer_factory=fold_transformer_factory,
     )
     result["oof_metrics"] = evaluate_probabilities(y, result["oof_pred"])
     result["feature_group_count"] = int(len(np.unique(groups)))
     result["models"].clear()
+    if result["fold_transformers"] is not None:
+        result["fold_transformers"].clear()
     return result
 
 
@@ -500,6 +554,9 @@ def _experiment_results_frame(
                 "feature_set": result["feature_set"],
                 "max_ctr_complexity": result["max_ctr_complexity"],
                 "added_interaction": result["added_interaction"],
+                "frequency_mode": result["frequency_mode"],
+                "frequency_source_features": result["frequency_source_features"],
+                "frequency_rare_threshold": result["frequency_rare_threshold"],
                 "params": json.dumps(result["params"], sort_keys=True, default=str),
                 "class_weight_strategy": result["params"].get("auto_class_weights", "None"),
                 "cv_strategy": "StratifiedKFold",
@@ -602,6 +659,7 @@ def _save_explanations(
     final_run: dict[str, Any],
     final_oof_pred: np.ndarray,
     categorical_features: list[str],
+    fold_transformers: list[FrequencyFeatureTransformer] | None = None,
 ) -> None:
     sample_size = min(2000, len(y))
     sample_indices = np.random.default_rng(RANDOM_STATE).choice(
@@ -612,13 +670,16 @@ def _save_explanations(
         indices = sample_indices[final_run["fold_id"][sample_indices] == fold]
         if not len(indices):
             continue
+        sample_X = prepared.X.iloc[indices]
+        if fold_transformers is not None:
+            sample_X = fold_transformers[fold].transform(sample_X)
         values = model.get_feature_importance(
-            Pool(prepared.X.iloc[indices], cat_features=categorical_features), type="ShapValues"
+            Pool(sample_X, cat_features=categorical_features), type="ShapValues"
         )[:, :-1]
         shap_rows.append(
             pd.DataFrame(
                 {
-                    "feature": prepared.X.columns,
+                    "feature": sample_X.columns,
                     "mean_abs_shap": np.abs(values).mean(axis=0),
                     "fold": fold,
                 }
@@ -650,8 +711,11 @@ def _save_explanations(
             continue
         index = int(indices[0])
         model = final_run["models"][final_run["fold_id"][index]]
+        sample_X = prepared.X.iloc[[index]]
+        if fold_transformers is not None:
+            sample_X = fold_transformers[final_run["fold_id"][index]].transform(sample_X)
         values = model.get_feature_importance(
-            Pool(prepared.X.iloc[[index]], cat_features=categorical_features), type="ShapValues"
+            Pool(sample_X, cat_features=categorical_features), type="ShapValues"
         )[0, :-1]
         for feature_index in np.argsort(np.abs(values))[-5:][::-1]:
             explanation_rows.append(
@@ -660,7 +724,7 @@ def _save_explanations(
                     "claim_id": train.iloc[index][ID_COL],
                     "label": int(y.iloc[index]),
                     "oof_fraud_probability": final_oof_pred[index],
-                    "feature": prepared.X.columns[feature_index],
+                    "feature": sample_X.columns[feature_index],
                     "shap_contribution": values[feature_index],
                 }
             )
@@ -673,8 +737,8 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     task_type = config.task_type.upper()
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
-    if config.profile not in {"baseline", "refined", "ctr"}:
-        raise ValueError("profile must be 'baseline', 'refined', or 'ctr'.")
+    if config.profile not in {"baseline", "refined", "ctr", "frequency"}:
+        raise ValueError("profile must be 'baseline', 'refined', 'ctr', or 'frequency'.")
     train, test = load_competition_data(config.project_root)
     paths = output_paths(config.project_root, profile=config.profile, run_name=config.run_name)
     features = validate_train_test_schema(train, test)
@@ -715,7 +779,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             combined_features,
         )
         screen_experiment_count = len(experiment_specs)
-    else:
+    elif config.profile == "ctr":
         combined_features = prepare_catboost_features(
             train,
             test,
@@ -726,7 +790,22 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         )
         experiment_specs = _ctr_stage_one_specs(combined_features)
         screen_experiment_count = len(experiment_specs) + len(CTR_INTERACTION_FEATURES) + 1
-    if config.profile in {"refined", "ctr"}:
+    else:
+        frequency_base = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            add_count_features=True,
+            add_interaction_features=True,
+            add_los_features=True,
+            add_count_bucket_features=True,
+            additional_interaction_features={
+                "dati2_typeppk": CTR_INTERACTION_FEATURES["dati2_typeppk"]
+            },
+        )
+        experiment_specs = _frequency_experiment_specs(frequency_base)
+        screen_experiment_count = len(experiment_specs)
+    if config.profile in {"refined", "ctr", "frequency"}:
         _validate_ensemble_seeds(config.ensemble_seeds)
         final_training_runs = len(config.ensemble_seeds) + 1
     else:
@@ -753,6 +832,11 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         name = experiment.name
         prepared = experiment.prepared
         params = _with_iteration_cap(experiment.params, config.iterations)
+        frequency_transformer = (
+            experiment.fold_transformer_factory()
+            if experiment.fold_transformer_factory is not None
+            else None
+        )
         progress.set_description(f"Experiment {index}/{screen_experiment_count}")
         result = train_catboost_cv(
             prepared.X,
@@ -766,6 +850,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             early_stopping_rounds=config.early_stopping_rounds,
             verbose=config.catboost_verbose if config.show_progress else False,
             progress_callback=fold_progress(name),
+            fold_transformer_factory=experiment.fold_transformer_factory,
         )
         result.update(
             {
@@ -774,12 +859,24 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "feature_set": experiment.feature_set,
                 "max_ctr_complexity": experiment.max_ctr_complexity,
                 "added_interaction": experiment.added_interaction,
+                "fold_transformer_factory": experiment.fold_transformer_factory,
+                "frequency_mode": frequency_transformer.mode if frequency_transformer else None,
+                "frequency_source_features": (
+                    ",".join(frequency_transformer.source_features)
+                    if frequency_transformer
+                    else None
+                ),
+                "frequency_rare_threshold": (
+                    frequency_transformer.rare_threshold if frequency_transformer else None
+                ),
                 "notes": experiment.notes,
                 "oof_metrics": evaluate_probabilities(y, result["oof_pred"]),
                 "prepared": prepared,
             }
         )
         result["models"].clear()
+        if result["fold_transformers"] is not None:
+            result["fold_transformers"].clear()
         experiment_runs[name] = result
 
     try:
@@ -834,6 +931,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                     model_prefix=f"catboost_seed_{seed}",
                     verbose=config.catboost_verbose if config.show_progress else False,
                     progress_callback=fold_progress(f"seed {seed}"),
+                    fold_transformer_factory=selected["fold_transformer_factory"],
                 )
             final_run = _combine_seed_runs(seed_runs, y)
             progress.set_description("Grouped robustness")
@@ -844,6 +942,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 config,
                 task_type,
                 fold_progress("grouped robustness"),
+                selected["fold_transformer_factory"],
             )
     finally:
         progress.close()
@@ -864,7 +963,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     ]
     calibration_sidecar_method: str | None = None
     calibration_sidecar_pred: np.ndarray | None = None
-    if config.profile in {"refined", "ctr"}:
+    if config.profile in {"refined", "ctr", "frequency"}:
         final_oof_pred = raw_oof_pred
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
@@ -889,7 +988,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
 
-    if config.profile in {"refined", "ctr"}:
+    if config.profile in {"refined", "ctr", "frequency"}:
         for seed, seed_run in final_run["seed_runs"].items():
             pd.DataFrame(
                 {
@@ -914,6 +1013,9 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                     feature_set=result["feature_set"],
                     max_ctr_complexity=result["max_ctr_complexity"],
                     added_interaction=result["added_interaction"],
+                    frequency_mode=result["frequency_mode"],
+                    frequency_source_features=result["frequency_source_features"],
+                    frequency_rare_threshold=result["frequency_rare_threshold"],
                     cv_strategy="StratifiedKFold",
                 )
                 for name, result in experiment_runs.items()
@@ -955,7 +1057,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "fraud_probability_raw": grouped_run["oof_pred"],
             }
         ).to_csv(paths["oof"] / "catboost_grouped_robustness_oof.csv", index=False)
-        if config.profile == "ctr":
+        if config.profile in {"ctr", "frequency"}:
             pd.DataFrame(bootstrap_audit_intervals(y, final_run["oof_pred"])).to_csv(
                 paths["metrics"] / "catboost_audit_bootstrap.csv", index=False
             )
@@ -1008,13 +1110,37 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         final_run,
         final_oof_pred,
         selected["prepared"].categorical_features,
+        final_run["fold_transformers"],
     )
 
+    frequency_transformer_config = None
+    if final_run["fold_transformers"]:
+        transformer = final_run["fold_transformers"][0]
+        if "seed_runs" in final_run:
+            fold_map_files_by_seed = {
+                str(seed): [
+                    f"catboost_seed_{seed}_frequency_fold_{fold}.json"
+                    for fold in range(config.n_splits)
+                ]
+                for seed in config.ensemble_seeds
+            }
+        else:
+            fold_map_files_by_seed = {
+                "baseline": [
+                    f"catboost_frequency_fold_{fold}.json" for fold in range(config.n_splits)
+                ]
+            }
+        frequency_transformer_config = {
+            "source_features": list(transformer.source_features),
+            "mode": transformer.mode,
+            "rare_threshold": transformer.rare_threshold,
+            "fold_map_files_by_seed": fold_map_files_by_seed,
+        }
     final_config = {
         "model": "CatBoostClassifier",
         "profile": config.profile,
         "run_name": config.run_name,
-        "features": list(selected["prepared"].X.columns),
+        "features": final_run["model_features"],
         "categorical_features": selected["prepared"].categorical_features,
         "excluded_features": [ID_COL],
         "params": final_run["params"],
@@ -1024,6 +1150,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             "max_ctr_complexity": selected["max_ctr_complexity"],
             "added_interaction": selected["added_interaction"],
         },
+        "frequency_transformer": frequency_transformer_config,
         "cv": {
             "type": "StratifiedKFold",
             "n_splits": config.n_splits,
@@ -1033,7 +1160,9 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         "calibration": calibration_method,
         "calibration_sidecar": calibration_sidecar_method,
         "ensemble_seeds": (
-            list(config.ensemble_seeds) if config.profile in {"refined", "ctr"} else None
+            list(config.ensemble_seeds)
+            if config.profile in {"refined", "ctr", "frequency"}
+            else None
         ),
         "iteration_diagnostics": {
             "iteration_cap": int(final_run["params"]["iterations"]),
@@ -1071,7 +1200,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "Decision": calibration_method,
                 "Reason": (
                     "Raw probabilities preserve the audit ranking."
-                    if config.profile in {"refined", "ctr"}
+                    if config.profile in {"refined", "ctr", "frequency"}
                     else "Calibration must improve Brier without unacceptable ranking loss."
                 ),
             },
@@ -1106,7 +1235,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default=os.environ.get("PRS_ITS_GPU_DEVICES", "0"))
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--catboost-verbose", type=int, default=100)
-    parser.add_argument("--profile", choices=["baseline", "refined", "ctr"], default="baseline")
+    parser.add_argument(
+        "--profile", choices=["baseline", "refined", "ctr", "frequency"], default="baseline"
+    )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--ensemble-seeds", default="42,2026,2718")

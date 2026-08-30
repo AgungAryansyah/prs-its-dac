@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 import prs_its.training as training
-from prs_its.modeling import CATEGORICAL_CANDIDATES
+from prs_its.modeling import CATEGORICAL_CANDIDATES, FrequencyFeatureTransformer
 from prs_its.metrics import evaluate_probabilities
 
 
@@ -72,6 +73,8 @@ def _fake_train_catboost_cv(X, y, X_test, categorical_features, cv, params, task
         "feature_importance": pd.DataFrame(
             {"feature": X.columns, "importance": np.ones(len(X.columns)), "fold": 0}
         ),
+        "model_features": list(X.columns),
+        "fold_transformers": None,
         "params": {**params, "task_type": task_type, "devices": devices},
     }
 
@@ -185,4 +188,76 @@ def test_ctr_profile_screens_then_confirms_in_an_isolated_run(tmp_path, monkeypa
     assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
     assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
     assert (run_dir / "models" / "catboost_final_config.json").exists()
+    assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
+
+
+def test_frequency_profile_screens_then_confirms_in_an_isolated_run(tmp_path, monkeypatch) -> None:
+    _configure_training_test(tmp_path, monkeypatch)
+    calls = []
+
+    def tracked_train_catboost_cv(*args, **kwargs):
+        transformer_factory = kwargs["fold_transformer_factory"]
+        calls.append(
+            (
+                kwargs["params"]["random_seed"],
+                transformer_factory().mode if transformer_factory is not None else None,
+            )
+        )
+        result = _fake_train_catboost_cv(*args, **kwargs)
+        if transformer_factory is None:
+            return result
+
+        transformer = transformer_factory().fit(args[0])
+        result["model_features"] = transformer.transform(args[0]).columns.tolist()
+        result["fold_transformers"] = [transformer, transformer]
+        model_dir = kwargs.get("model_dir")
+        if model_dir is not None:
+            for fold in range(2):
+                transformer.save(model_dir / f"{kwargs['model_prefix']}_frequency_fold_{fold}.json")
+        return result
+
+    monkeypatch.setattr(training, "train_catboost_cv", tracked_train_catboost_cv)
+    monkeypatch.setattr(training, "_select_experiment", lambda _: "frequency_count")
+
+    result = training.run_training(
+        training.TrainingConfig(
+            project_root=tmp_path,
+            task_type="CPU",
+            n_splits=2,
+            profile="frequency",
+            run_name="frequency-check",
+            iterations=12,
+        )
+    )
+
+    run_dir = tmp_path / "outputs" / "runs" / "frequency-check"
+    experiments = pd.read_csv(run_dir / "metrics" / "catboost_experiments.csv")
+    assert result["profile"] == "frequency"
+    assert {
+        "frequency_control",
+        "frequency_count",
+        "frequency_log_count",
+        "frequency_rare_flag",
+    } == set(experiments["experiment_name"])
+    assert set(experiments["frequency_mode"].dropna()) == {"count", "log_count", "rare_flag"}
+    assert calls[:4] == [(42, None), (42, "count"), (42, "log_count"), (42, "rare_flag")]
+    assert calls[-4:] == [(42, "count"), (2026, "count"), (2718, "count"), (42, "count")]
+    assert len(calls) == 8
+    assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
+    assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
+    with (run_dir / "models" / "catboost_final_config.json").open() as file:
+        final_config = json.load(file)
+    assert final_config["frequency_transformer"]["mode"] == "count"
+    assert final_config["frequency_transformer"]["fold_map_files_by_seed"] == {
+        "42": ["catboost_seed_42_frequency_fold_0.json", "catboost_seed_42_frequency_fold_1.json"],
+        "2026": [
+            "catboost_seed_2026_frequency_fold_0.json",
+            "catboost_seed_2026_frequency_fold_1.json",
+        ],
+        "2718": [
+            "catboost_seed_2718_frequency_fold_0.json",
+            "catboost_seed_2718_frequency_fold_1.json",
+        ],
+    }
+    assert len(list((run_dir / "models").glob("catboost_seed_*_frequency_fold_*.json"))) == 6
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
