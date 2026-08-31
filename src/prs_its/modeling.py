@@ -35,6 +35,30 @@ INTERACTION_FEATURES = {
 }
 SECONDARY_DIAGNOSIS_COUNT_BUCKET = "secondary_diagnosis_count_bucket"
 PROCEDURE_COUNT_BUCKET = "procedure_count_bucket"
+SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT = "secondary_diagnosis_active_group_count"
+PROCEDURE_ACTIVE_GROUP_COUNT = "procedure_active_group_count"
+SECONDARY_DIAGNOSIS_MAX_GROUP_COUNT = "secondary_diagnosis_max_group_count"
+PROCEDURE_MAX_GROUP_COUNT = "procedure_max_group_count"
+SECONDARY_DIAGNOSIS_CONCENTRATION = "secondary_diagnosis_concentration"
+PROCEDURE_CONCENTRATION = "procedure_concentration"
+CLINICAL_TOTAL_BURDEN = "clinical_total_burden"
+PROCEDURE_BURDEN_SHARE = "procedure_burden_share"
+CLINICAL_SHAPE_FEATURES = {
+    "active_groups": (
+        SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT,
+        PROCEDURE_ACTIVE_GROUP_COUNT,
+    ),
+    "concentration": (
+        SECONDARY_DIAGNOSIS_MAX_GROUP_COUNT,
+        PROCEDURE_MAX_GROUP_COUNT,
+        SECONDARY_DIAGNOSIS_CONCENTRATION,
+        PROCEDURE_CONCENTRATION,
+    ),
+    "joint_burden": (
+        CLINICAL_TOTAL_BURDEN,
+        PROCEDURE_BURDEN_SHARE,
+    ),
+}
 FREQUENCY_SOURCE_FEATURES = (
     "dati2",
     "kdkc",
@@ -239,6 +263,7 @@ def prepare_catboost_features(
     add_interaction_features: bool = False,
     add_los_features: bool = False,
     add_count_bucket_features: bool = False,
+    clinical_shape_family: str | None = None,
     additional_interaction_features: dict[str, tuple[str, ...]] | None = None,
 ) -> PreparedFeatures:
     X = train.loc[:, spec.features].copy()
@@ -252,6 +277,13 @@ def prepare_catboost_features(
 
     if add_count_bucket_features and not add_count_features:
         raise ValueError("Count bucket features require add_count_features=True.")
+    if clinical_shape_family is not None and not add_count_features:
+        raise ValueError("Clinical-shape features require add_count_features=True.")
+    if clinical_shape_family is not None and clinical_shape_family not in CLINICAL_SHAPE_FEATURES:
+        raise ValueError(
+            f"Unknown clinical-shape family: {clinical_shape_family!r}. "
+            f"Expected one of {sorted(CLINICAL_SHAPE_FEATURES)}."
+        )
 
     if add_count_features:
         diagnosis_columns = [column for column in spec.features if column.startswith("dx2_")]
@@ -268,6 +300,37 @@ def prepare_catboost_features(
         X_test["procedure_count"] = X_test[procedure_columns].apply(
             pd.to_numeric, errors="coerce"
         ).sum(axis=1, min_count=1)
+
+    if clinical_shape_family is not None:
+        for frame in (X, X_test):
+            diagnosis_values = frame[diagnosis_columns].apply(pd.to_numeric, errors="coerce")
+            procedure_values = frame[procedure_columns].apply(pd.to_numeric, errors="coerce")
+            if clinical_shape_family == "active_groups":
+                frame[SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT] = (
+                    diagnosis_values.gt(0).sum(axis=1).where(diagnosis_values.notna().any(axis=1))
+                )
+                frame[PROCEDURE_ACTIVE_GROUP_COUNT] = (
+                    procedure_values.gt(0).sum(axis=1).where(procedure_values.notna().any(axis=1))
+                )
+            elif clinical_shape_family == "concentration":
+                diagnosis_maximum = diagnosis_values.max(axis=1)
+                procedure_maximum = procedure_values.max(axis=1)
+                frame[SECONDARY_DIAGNOSIS_MAX_GROUP_COUNT] = diagnosis_maximum
+                frame[PROCEDURE_MAX_GROUP_COUNT] = procedure_maximum
+                frame[SECONDARY_DIAGNOSIS_CONCENTRATION] = diagnosis_maximum.divide(
+                    frame["secondary_diagnosis_count"].clip(lower=1)
+                )
+                frame[PROCEDURE_CONCENTRATION] = procedure_maximum.divide(
+                    frame["procedure_count"].clip(lower=1)
+                )
+            else:
+                total_burden = frame[["secondary_diagnosis_count", "procedure_count"]].sum(
+                    axis=1, min_count=1
+                )
+                frame[CLINICAL_TOTAL_BURDEN] = total_burden
+                frame[PROCEDURE_BURDEN_SHARE] = frame["procedure_count"].divide(
+                    total_burden.clip(lower=1)
+                )
 
     if add_count_bucket_features:
         for frame in (X, X_test):

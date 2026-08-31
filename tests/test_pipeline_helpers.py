@@ -9,9 +9,18 @@ from prs_its.calibration import calibrate_test_predictions, cross_fit_calibratio
 from prs_its.fairness import age_groups, fairness_audit_rates
 from prs_its.modeling import (
     CATEGORICAL_CANDIDATES,
+    CLINICAL_SHAPE_FEATURES,
+    CLINICAL_TOTAL_BURDEN,
     FrequencyFeatureTransformer,
+    PROCEDURE_ACTIVE_GROUP_COUNT,
+    PROCEDURE_BURDEN_SHARE,
     PROCEDURE_COUNT_BUCKET,
+    PROCEDURE_CONCENTRATION,
+    PROCEDURE_MAX_GROUP_COUNT,
+    SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT,
     SECONDARY_DIAGNOSIS_COUNT_BUCKET,
+    SECONDARY_DIAGNOSIS_CONCENTRATION,
+    SECONDARY_DIAGNOSIS_MAX_GROUP_COUNT,
     feature_signature_groups,
     make_feature_spec,
     prepare_catboost_features,
@@ -120,6 +129,65 @@ def test_count_buckets_require_count_features() -> None:
 
     with pytest.raises(ValueError, match="require"):
         prepare_catboost_features(train, test, spec, add_count_bucket_features=True)
+
+
+def test_clinical_shape_features_capture_activity_concentration_and_burden() -> None:
+    train, test = _datasets()
+    for frame in (train, test):
+        frame["dx2_c00_d48"] = 0.0
+        frame["proc14_23"] = 0.0
+    train.loc[0, ["dx2_a00_b99", "dx2_c00_d48", "proc00_13", "proc14_23"]] = [2, 0, 1, 3]
+    train.loc[1, ["dx2_a00_b99", "dx2_c00_d48", "proc00_13", "proc14_23"]] = [1, 2, 0, 0]
+    train.loc[2, ["dx2_a00_b99", "dx2_c00_d48", "proc00_13", "proc14_23"]] = [
+        np.nan,
+        np.nan,
+        1,
+        0,
+    ]
+    spec = make_feature_spec(train, test)
+
+    active = prepare_catboost_features(
+        train, test, spec, add_count_features=True, clinical_shape_family="active_groups"
+    )
+    concentration = prepare_catboost_features(
+        train, test, spec, add_count_features=True, clinical_shape_family="concentration"
+    )
+    burden = prepare_catboost_features(
+        train, test, spec, add_count_features=True, clinical_shape_family="joint_burden"
+    )
+
+    assert set(CLINICAL_SHAPE_FEATURES["active_groups"]) <= set(active.X)
+    assert active.X.loc[0, SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT] == 1
+    assert active.X.loc[0, PROCEDURE_ACTIVE_GROUP_COUNT] == 2
+    assert active.X.loc[1, SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT] == 2
+    assert active.X.loc[1, PROCEDURE_ACTIVE_GROUP_COUNT] == 0
+    assert pd.isna(active.X.loc[2, SECONDARY_DIAGNOSIS_ACTIVE_GROUP_COUNT])
+    assert set(CLINICAL_SHAPE_FEATURES["concentration"]) <= set(concentration.X)
+    assert concentration.X.loc[0, SECONDARY_DIAGNOSIS_MAX_GROUP_COUNT] == 2
+    assert concentration.X.loc[0, PROCEDURE_MAX_GROUP_COUNT] == 3
+    assert concentration.X.loc[0, SECONDARY_DIAGNOSIS_CONCENTRATION] == 1
+    assert concentration.X.loc[0, PROCEDURE_CONCENTRATION] == 0.75
+    assert pd.isna(concentration.X.loc[2, SECONDARY_DIAGNOSIS_CONCENTRATION])
+    assert set(CLINICAL_SHAPE_FEATURES["joint_burden"]) <= set(burden.X)
+    assert burden.X.loc[0, CLINICAL_TOTAL_BURDEN] == 6
+    assert burden.X.loc[0, PROCEDURE_BURDEN_SHARE] == 2 / 3
+    assert burden.X.loc[1, CLINICAL_TOTAL_BURDEN] == 3
+    assert burden.X.loc[1, PROCEDURE_BURDEN_SHARE] == 0
+    assert list(active.X.columns) == list(active.X_test.columns)
+    assert list(concentration.X.columns) == list(concentration.X_test.columns)
+    assert list(burden.X.columns) == list(burden.X_test.columns)
+
+
+def test_clinical_shape_features_require_counts_and_known_family() -> None:
+    train, test = _datasets()
+    spec = make_feature_spec(train, test)
+
+    with pytest.raises(ValueError, match="require"):
+        prepare_catboost_features(train, test, spec, clinical_shape_family="active_groups")
+    with pytest.raises(ValueError, match="Unknown clinical-shape family"):
+        prepare_catboost_features(
+            train, test, spec, add_count_features=True, clinical_shape_family="unknown"
+        )
 
 
 def test_frequency_transformer_uses_training_counts_and_round_trips(tmp_path) -> None:
