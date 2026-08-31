@@ -16,6 +16,7 @@ dependencies = [
     "scipy>=1.15",
     "scikit-learn>=1.6",
     "tqdm>=4.67",
+    "xgboost>=3.4.1",
 ]
 
 [dependency-groups]
@@ -26,6 +27,7 @@ dev = [
 [project.scripts]
 prs-its = "prs_its:main"
 prs-its-train = "prs_its.training:main"
+prs-its-xgb-train = "prs_its.xgb_training:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
