@@ -261,3 +261,60 @@ def test_frequency_profile_screens_then_confirms_in_an_isolated_run(tmp_path, mo
     }
     assert len(list((run_dir / "models").glob("catboost_seed_*_frequency_fold_*.json"))) == 6
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
+
+
+def test_clinical_shape_profile_screens_then_confirms_in_an_isolated_run(
+    tmp_path, monkeypatch
+) -> None:
+    _configure_training_test(tmp_path, monkeypatch)
+    calls = []
+
+    def tracked_train_catboost_cv(*args, **kwargs):
+        calls.append(kwargs["params"]["random_seed"])
+        return _fake_train_catboost_cv(*args, **kwargs)
+
+    monkeypatch.setattr(training, "train_catboost_cv", tracked_train_catboost_cv)
+    monkeypatch.setattr(training, "_select_experiment", lambda _: "clinical_shape_active_groups")
+
+    result = training.run_training(
+        training.TrainingConfig(
+            project_root=tmp_path,
+            task_type="CPU",
+            n_splits=2,
+            profile="clinical-shape",
+            run_name="clinical-shape-check",
+            iterations=12,
+        )
+    )
+
+    run_dir = tmp_path / "outputs" / "runs" / "clinical-shape-check"
+    experiments = pd.read_csv(run_dir / "metrics" / "catboost_experiments.csv")
+    assert result["profile"] == "clinical-shape"
+    assert {
+        "clinical_shape_control",
+        "clinical_shape_active_groups",
+        "clinical_shape_concentration",
+        "clinical_shape_joint_burden",
+    } == set(experiments["experiment_name"])
+    assert set(experiments["clinical_shape_family"].dropna()) == {
+        "active_groups",
+        "concentration",
+        "joint_burden",
+    }
+    assert calls[:4] == [42] * 4
+    assert calls[-4:] == [42, 2026, 2718, 42]
+    assert len(calls) == 8
+    assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
+    assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
+    with (run_dir / "models" / "catboost_final_config.json").open() as file:
+        final_config = json.load(file)
+    assert final_config["experiment"]["clinical_shape_family"] == "active_groups"
+    assert final_config["clinical_shape"] == {
+        "family": "active_groups",
+        "features": [
+            "secondary_diagnosis_active_group_count",
+            "procedure_active_group_count",
+        ],
+    }
+    assert "secondary_diagnosis_active_group_count" in final_config["features"]
+    assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()

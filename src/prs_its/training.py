@@ -29,6 +29,7 @@ from prs_its.fairness import age_groups, fairness_across_budgets
 from prs_its.metrics import audit_metrics, bootstrap_audit_intervals, evaluate_probabilities
 from prs_its.modeling import (
     BASE_PARAMS,
+    CLINICAL_SHAPE_FEATURES,
     ID_COL,
     N_SPLITS,
     PROCEDURE_COUNT_BUCKET,
@@ -51,6 +52,11 @@ from prs_its.modeling import (
     validate_train_test_schema,
 )
 from prs_its.submission import make_submission
+
+
+ISOLATED_PROFILES = {"refined", "ctr", "frequency", "clinical-shape"}
+ENSEMBLE_PROFILES = ISOLATED_PROFILES
+BOOTSTRAP_PROFILES = {"ctr", "frequency", "clinical-shape"}
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,7 @@ class ExperimentSpec:
     stage: str = "screen"
     max_ctr_complexity: int | None = None
     added_interaction: str | None = None
+    clinical_shape_family: str | None = None
     fold_transformer_factory: Callable[[], FrequencyFeatureTransformer] | None = None
 
 
@@ -94,13 +101,15 @@ def output_paths(
     project_root: Path, profile: str = "baseline", run_name: str | None = None
 ) -> dict[str, Path]:
     output_dir = project_root / "outputs"
-    if profile in {"refined", "ctr", "frequency"}:
+    if profile in ISOLATED_PROFILES:
         name = run_name or profile
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("run_name may contain only letters, numbers, underscores, and hyphens.")
         output_dir = output_dir / "runs" / name
     elif profile != "baseline":
-        raise ValueError("profile must be 'baseline', 'refined', 'ctr', or 'frequency'.")
+        raise ValueError(
+            "profile must be 'baseline', 'refined', 'ctr', 'frequency', or 'clinical-shape'."
+        )
     paths = {
         "models": output_dir / "models",
         "oof": output_dir / "oof",
@@ -388,6 +397,58 @@ def _frequency_experiment_specs(
     return specs
 
 
+def _clinical_shape_experiment_specs(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    spec: FeatureSpec,
+) -> list[ExperimentSpec]:
+    common_kwargs = {
+        "add_count_features": True,
+        "add_interaction_features": True,
+        "add_los_features": True,
+        "add_count_bucket_features": True,
+        "additional_interaction_features": {
+            "dati2_typeppk": CTR_INTERACTION_FEATURES["dati2_typeppk"]
+        },
+    }
+    params = _deep_combined_params(max_ctr_complexity=4)
+    control = prepare_catboost_features(train, test, spec, **common_kwargs)
+    specs = [
+        ExperimentSpec(
+            "clinical_shape_control",
+            control,
+            params.copy(),
+            "ctr_incumbent",
+            "Winning CTR configuration without clinical-shape features.",
+            stage="clinical_shape",
+            max_ctr_complexity=4,
+            added_interaction="dati2_typeppk",
+        )
+    ]
+    for family in CLINICAL_SHAPE_FEATURES:
+        prepared = prepare_catboost_features(
+            train,
+            test,
+            spec,
+            **common_kwargs,
+            clinical_shape_family=family,
+        )
+        specs.append(
+            ExperimentSpec(
+                f"clinical_shape_{family}",
+                prepared,
+                params.copy(),
+                f"ctr_incumbent_and_clinical_shape_{family}",
+                "Winning CTR configuration plus one clinical-shape feature family.",
+                stage="clinical_shape",
+                max_ctr_complexity=4,
+                added_interaction="dati2_typeppk",
+                clinical_shape_family=family,
+            )
+        )
+    return specs
+
+
 def _with_iteration_cap(params: dict[str, Any], iterations: int | None) -> dict[str, Any]:
     if iterations is None:
         return params.copy()
@@ -554,6 +615,7 @@ def _experiment_results_frame(
                 "feature_set": result["feature_set"],
                 "max_ctr_complexity": result["max_ctr_complexity"],
                 "added_interaction": result["added_interaction"],
+                "clinical_shape_family": result["clinical_shape_family"],
                 "frequency_mode": result["frequency_mode"],
                 "frequency_source_features": result["frequency_source_features"],
                 "frequency_rare_threshold": result["frequency_rare_threshold"],
@@ -737,8 +799,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     task_type = config.task_type.upper()
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
-    if config.profile not in {"baseline", "refined", "ctr", "frequency"}:
-        raise ValueError("profile must be 'baseline', 'refined', 'ctr', or 'frequency'.")
+    if config.profile not in {"baseline", *ISOLATED_PROFILES}:
+        raise ValueError(
+            "profile must be 'baseline', 'refined', 'ctr', 'frequency', or 'clinical-shape'."
+        )
     train, test = load_competition_data(config.project_root)
     paths = output_paths(config.project_root, profile=config.profile, run_name=config.run_name)
     features = validate_train_test_schema(train, test)
@@ -790,7 +854,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         )
         experiment_specs = _ctr_stage_one_specs(combined_features)
         screen_experiment_count = len(experiment_specs) + len(CTR_INTERACTION_FEATURES) + 1
-    else:
+    elif config.profile == "frequency":
         frequency_base = prepare_catboost_features(
             train,
             test,
@@ -805,7 +869,10 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         )
         experiment_specs = _frequency_experiment_specs(frequency_base)
         screen_experiment_count = len(experiment_specs)
-    if config.profile in {"refined", "ctr", "frequency"}:
+    else:
+        experiment_specs = _clinical_shape_experiment_specs(train, test, spec)
+        screen_experiment_count = len(experiment_specs)
+    if config.profile in ENSEMBLE_PROFILES:
         _validate_ensemble_seeds(config.ensemble_seeds)
         final_training_runs = len(config.ensemble_seeds) + 1
     else:
@@ -859,6 +926,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "feature_set": experiment.feature_set,
                 "max_ctr_complexity": experiment.max_ctr_complexity,
                 "added_interaction": experiment.added_interaction,
+                "clinical_shape_family": experiment.clinical_shape_family,
                 "fold_transformer_factory": experiment.fold_transformer_factory,
                 "frequency_mode": frequency_transformer.mode if frequency_transformer else None,
                 "frequency_source_features": (
@@ -963,7 +1031,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
     ]
     calibration_sidecar_method: str | None = None
     calibration_sidecar_pred: np.ndarray | None = None
-    if config.profile in {"refined", "ctr", "frequency"}:
+    if config.profile in ENSEMBLE_PROFILES:
         final_oof_pred = raw_oof_pred
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
@@ -988,7 +1056,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         final_metrics = raw_metrics
         final_test_pred = raw_test_pred
 
-    if config.profile in {"refined", "ctr", "frequency"}:
+    if config.profile in ENSEMBLE_PROFILES:
         for seed, seed_run in final_run["seed_runs"].items():
             pd.DataFrame(
                 {
@@ -1013,6 +1081,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                     feature_set=result["feature_set"],
                     max_ctr_complexity=result["max_ctr_complexity"],
                     added_interaction=result["added_interaction"],
+                    clinical_shape_family=result["clinical_shape_family"],
                     frequency_mode=result["frequency_mode"],
                     frequency_source_features=result["frequency_source_features"],
                     frequency_rare_threshold=result["frequency_rare_threshold"],
@@ -1057,7 +1126,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "fraud_probability_raw": grouped_run["oof_pred"],
             }
         ).to_csv(paths["oof"] / "catboost_grouped_robustness_oof.csv", index=False)
-        if config.profile in {"ctr", "frequency"}:
+        if config.profile in BOOTSTRAP_PROFILES:
             pd.DataFrame(bootstrap_audit_intervals(y, final_run["oof_pred"])).to_csv(
                 paths["metrics"] / "catboost_audit_bootstrap.csv", index=False
             )
@@ -1149,7 +1218,16 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             "stage": selected["experiment_stage"],
             "max_ctr_complexity": selected["max_ctr_complexity"],
             "added_interaction": selected["added_interaction"],
+            "clinical_shape_family": selected["clinical_shape_family"],
         },
+        "clinical_shape": (
+            {
+                "family": selected["clinical_shape_family"],
+                "features": list(CLINICAL_SHAPE_FEATURES[selected["clinical_shape_family"]]),
+            }
+            if selected["clinical_shape_family"] is not None
+            else None
+        ),
         "frequency_transformer": frequency_transformer_config,
         "cv": {
             "type": "StratifiedKFold",
@@ -1161,7 +1239,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         "calibration_sidecar": calibration_sidecar_method,
         "ensemble_seeds": (
             list(config.ensemble_seeds)
-            if config.profile in {"refined", "ctr", "frequency"}
+            if config.profile in ENSEMBLE_PROFILES
             else None
         ),
         "iteration_diagnostics": {
@@ -1200,7 +1278,7 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
                 "Decision": calibration_method,
                 "Reason": (
                     "Raw probabilities preserve the audit ranking."
-                    if config.profile in {"refined", "ctr", "frequency"}
+                    if config.profile in ENSEMBLE_PROFILES
                     else "Calibration must improve Brier without unacceptable ranking loss."
                 ),
             },
@@ -1236,7 +1314,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--catboost-verbose", type=int, default=100)
     parser.add_argument(
-        "--profile", choices=["baseline", "refined", "ctr", "frequency"], default="baseline"
+        "--profile",
+        choices=["baseline", "refined", "ctr", "frequency", "clinical-shape"],
+        default="baseline",
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--iterations", type=int, default=None)
