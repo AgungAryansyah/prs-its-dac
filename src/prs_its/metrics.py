@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Iterable
 
 import numpy as np
+import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
+
+from prs_its.fairness import fairness_across_budgets
+
+
+PAIRED_AUDIT_METRICS = (
+    "fraud_caught",
+    "legitimate_audits",
+    "recall",
+    "normalized_recall",
+    "precision",
+    "lift",
+)
 
 
 def _validated_arrays(
@@ -164,3 +178,419 @@ def evaluate_probabilities(
             if name not in {"audit_fraction", "n_rows", "total_fraud", "prevalence"}:
                 metrics[f"{name}_at_{suffix}"] = value
     return metrics
+
+
+def validate_paired_oof(
+    candidate: pd.DataFrame,
+    incumbent: pd.DataFrame,
+    candidate_probability_column: str = "fraud_probability_raw",
+    incumbent_probability_column: str = "fraud_probability_raw",
+    id_column: str = "claim_id",
+    target_column: str = "label",
+    fold_column: str = "fold",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    candidate_labels, candidate_probabilities, candidate_folds = _validated_oof_frame(
+        candidate,
+        probability_column=candidate_probability_column,
+        id_column=id_column,
+        target_column=target_column,
+        fold_column=fold_column,
+    )
+    incumbent_labels, incumbent_probabilities, incumbent_folds = _validated_oof_frame(
+        incumbent,
+        probability_column=incumbent_probability_column,
+        id_column=id_column,
+        target_column=target_column,
+        fold_column=fold_column,
+    )
+    if not candidate[id_column].reset_index(drop=True).equals(
+        incumbent[id_column].reset_index(drop=True)
+    ):
+        raise ValueError("Candidate and incumbent claim_id order must be identical.")
+    if not np.array_equal(candidate_labels, incumbent_labels):
+        raise ValueError("Candidate and incumbent label order must be identical.")
+    if not np.array_equal(candidate_folds, incumbent_folds):
+        raise ValueError("Candidate and incumbent fold assignments must be identical.")
+    return candidate_labels, candidate_probabilities, incumbent_probabilities, candidate_folds
+
+
+def paired_bootstrap_comparison(
+    y_true: Iterable[int] | np.ndarray,
+    candidate_probabilities: Iterable[float] | np.ndarray,
+    incumbent_probabilities: Iterable[float] | np.ndarray,
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    if n_bootstrap <= 0:
+        raise ValueError("n_bootstrap must be positive.")
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be within (0, 1).")
+    if not audit_fractions or any(not 0 <= fraction <= 1 for fraction in audit_fractions):
+        raise ValueError("audit_fractions must contain values within [0, 1].")
+
+    labels, candidate_scores = _validated_arrays(y_true, candidate_probabilities)
+    incumbent_labels, incumbent_scores = _validated_arrays(y_true, incumbent_probabilities)
+    if not np.array_equal(labels, incumbent_labels):
+        raise ValueError("Candidate and incumbent labels must be identical.")
+
+    point_estimates = _paired_metric_rows(
+        labels, candidate_scores, incumbent_scores, audit_fractions
+    )
+    bootstrap_deltas = np.empty((n_bootstrap, len(point_estimates)), dtype=float)
+    random = np.random.default_rng(random_state)
+    for iteration in range(n_bootstrap):
+        sampled_indices = random.integers(0, len(labels), size=len(labels))
+        sampled_rows = _paired_metric_rows(
+            labels[sampled_indices],
+            candidate_scores[sampled_indices],
+            incumbent_scores[sampled_indices],
+            audit_fractions,
+        )
+        bootstrap_deltas[iteration] = [row["delta"] for row in sampled_rows]
+
+    lower_quantile = (1 - confidence_level) / 2
+    upper_quantile = 1 - lower_quantile
+    comparison = pd.DataFrame(point_estimates)
+    comparison["ci_lower"] = np.quantile(bootstrap_deltas, lower_quantile, axis=0)
+    comparison["ci_upper"] = np.quantile(bootstrap_deltas, upper_quantile, axis=0)
+    comparison["n_bootstrap"] = n_bootstrap
+    comparison["confidence_level"] = confidence_level
+    comparison["comparison"] = "candidate_minus_incumbent"
+    return comparison
+
+
+def paired_oof_comparison(
+    candidate: pd.DataFrame,
+    incumbent: pd.DataFrame,
+    candidate_probability_column: str = "fraud_probability_raw",
+    incumbent_probability_column: str = "fraud_probability_raw",
+    id_column: str = "claim_id",
+    target_column: str = "label",
+    fold_column: str = "fold",
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    labels, candidate_scores, incumbent_scores, _ = validate_paired_oof(
+        candidate,
+        incumbent,
+        candidate_probability_column=candidate_probability_column,
+        incumbent_probability_column=incumbent_probability_column,
+        id_column=id_column,
+        target_column=target_column,
+        fold_column=fold_column,
+    )
+    return paired_bootstrap_comparison(
+        labels,
+        candidate_scores,
+        incumbent_scores,
+        audit_fractions=audit_fractions,
+        n_bootstrap=n_bootstrap,
+        confidence_level=confidence_level,
+        random_state=random_state,
+    )
+
+
+def fairness_rate_deltas(
+    groups: pd.Series,
+    y_true: Iterable[int] | np.ndarray,
+    candidate_probabilities: Iterable[float] | np.ndarray,
+    incumbent_probabilities: Iterable[float] | np.ndarray,
+    group_name: str,
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    min_legitimate_count: int = 100,
+) -> pd.DataFrame:
+    labels, candidate_scores = _validated_arrays(y_true, candidate_probabilities)
+    _, incumbent_scores = _validated_arrays(y_true, incumbent_probabilities)
+    group_series = _validated_groups(groups, len(labels), group_name)
+    candidate_rates = fairness_across_budgets(
+        group_series,
+        labels,
+        candidate_scores,
+        group_name=group_name,
+        audit_fractions=audit_fractions,
+        min_legitimate_count=min_legitimate_count,
+    )
+    incumbent_rates = fairness_across_budgets(
+        group_series,
+        labels,
+        incumbent_scores,
+        group_name=group_name,
+        audit_fractions=audit_fractions,
+        min_legitimate_count=min_legitimate_count,
+    )
+    keys = ["group_variable", "group", "audit_fraction"]
+    candidate_columns = [
+        *keys,
+        "nonfraud_count",
+        "audited_nonfraud_count",
+        "audit_rate",
+        "eligible_for_comparison",
+    ]
+    candidate_rates = candidate_rates.loc[:, candidate_columns].rename(
+        columns={
+            "nonfraud_count": "candidate_nonfraud_count",
+            "audited_nonfraud_count": "candidate_audited_nonfraud_count",
+            "audit_rate": "candidate_audit_rate",
+            "eligible_for_comparison": "candidate_eligible_for_comparison",
+        }
+    )
+    incumbent_rates = incumbent_rates.loc[:, candidate_columns].rename(
+        columns={
+            "nonfraud_count": "incumbent_nonfraud_count",
+            "audited_nonfraud_count": "incumbent_audited_nonfraud_count",
+            "audit_rate": "incumbent_audit_rate",
+            "eligible_for_comparison": "incumbent_eligible_for_comparison",
+        }
+    )
+    comparison = candidate_rates.merge(
+        incumbent_rates,
+        on=keys,
+        how="outer",
+        validate="one_to_one",
+        indicator=True,
+    )
+    if not comparison["_merge"].eq("both").all():
+        raise RuntimeError("Candidate and incumbent fairness subgroup schemas differ.")
+    comparison = comparison.drop(columns="_merge")
+    if not comparison["candidate_nonfraud_count"].equals(
+        comparison["incumbent_nonfraud_count"]
+    ):
+        raise RuntimeError("Candidate and incumbent legitimate subgroup counts differ.")
+    comparison["audit_rate_delta"] = (
+        comparison["candidate_audit_rate"] - comparison["incumbent_audit_rate"]
+    )
+    comparison["comparison"] = "candidate_minus_incumbent"
+    return comparison.sort_values(keys).reset_index(drop=True)
+
+
+def paired_fairness_gap_intervals(
+    y_true: Iterable[int] | np.ndarray,
+    candidate_probabilities: Iterable[float] | np.ndarray,
+    incumbent_probabilities: Iterable[float] | np.ndarray,
+    group_variables: Mapping[str, pd.Series],
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    min_legitimate_count: int = 100,
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    if n_bootstrap <= 0:
+        raise ValueError("n_bootstrap must be positive.")
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be within (0, 1).")
+    if not group_variables:
+        raise ValueError("group_variables must not be empty.")
+
+    labels, candidate_scores = _validated_arrays(y_true, candidate_probabilities)
+    _, incumbent_scores = _validated_arrays(y_true, incumbent_probabilities)
+    validated_groups = {
+        group_name: _validated_groups(groups, len(labels), group_name)
+        for group_name, groups in group_variables.items()
+    }
+    point_estimates = _fairness_gap_rows(
+        labels,
+        candidate_scores,
+        incumbent_scores,
+        validated_groups,
+        audit_fractions,
+        min_legitimate_count,
+    )
+    bootstrap_deltas = np.full((n_bootstrap, len(point_estimates)), np.nan, dtype=float)
+    random = np.random.default_rng(random_state)
+    for iteration in range(n_bootstrap):
+        sampled_indices = random.integers(0, len(labels), size=len(labels))
+        sampled_groups = {
+            name: groups.iloc[sampled_indices].reset_index(drop=True)
+            for name, groups in validated_groups.items()
+        }
+        sampled_rows = _fairness_gap_rows(
+            labels[sampled_indices],
+            candidate_scores[sampled_indices],
+            incumbent_scores[sampled_indices],
+            sampled_groups,
+            audit_fractions,
+            min_legitimate_count,
+        )
+        bootstrap_deltas[iteration] = [row["delta"] for row in sampled_rows]
+
+    lower_quantile = (1 - confidence_level) / 2
+    upper_quantile = 1 - lower_quantile
+    comparison = pd.DataFrame(point_estimates)
+    lower = []
+    upper = []
+    for column in bootstrap_deltas.T:
+        finite = column[np.isfinite(column)]
+        lower.append(float(np.quantile(finite, lower_quantile)) if len(finite) else np.nan)
+        upper.append(float(np.quantile(finite, upper_quantile)) if len(finite) else np.nan)
+    comparison["ci_lower"] = lower
+    comparison["ci_upper"] = upper
+    comparison["n_bootstrap"] = n_bootstrap
+    comparison["confidence_level"] = confidence_level
+    comparison["comparison"] = "candidate_minus_incumbent"
+    return comparison
+
+
+def paired_fairness_comparison(
+    y_true: Iterable[int] | np.ndarray,
+    candidate_probabilities: Iterable[float] | np.ndarray,
+    incumbent_probabilities: Iterable[float] | np.ndarray,
+    gender_groups: pd.Series,
+    age_group_values: pd.Series,
+    audit_fractions: tuple[float, ...] = (0.03, 0.05, 0.07),
+    min_legitimate_count: int = 100,
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> dict[str, pd.DataFrame]:
+    group_variables = {"gender": gender_groups, "age_group": age_group_values}
+    rate_deltas = pd.concat(
+        [
+            fairness_rate_deltas(
+                groups,
+                y_true,
+                candidate_probabilities,
+                incumbent_probabilities,
+                group_name=group_name,
+                audit_fractions=audit_fractions,
+                min_legitimate_count=min_legitimate_count,
+            )
+            for group_name, groups in group_variables.items()
+        ],
+        ignore_index=True,
+    )
+    return {
+        "subgroup_rate_deltas": rate_deltas,
+        "gap_intervals": paired_fairness_gap_intervals(
+            y_true,
+            candidate_probabilities,
+            incumbent_probabilities,
+            group_variables=group_variables,
+            audit_fractions=audit_fractions,
+            min_legitimate_count=min_legitimate_count,
+            n_bootstrap=n_bootstrap,
+            confidence_level=confidence_level,
+            random_state=random_state,
+        ),
+    }
+
+
+def _validated_oof_frame(
+    frame: pd.DataFrame,
+    probability_column: str,
+    id_column: str,
+    target_column: str,
+    fold_column: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    required_columns = {id_column, target_column, fold_column, probability_column}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(f"OOF frame is missing required columns: {missing_columns}")
+    if frame[id_column].isna().any() or frame[id_column].duplicated().any():
+        raise ValueError("OOF claim_id values must be present and unique.")
+    labels, probabilities = _validated_arrays(frame[target_column], frame[probability_column])
+    folds = pd.to_numeric(frame[fold_column], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(folds).all() or not np.equal(folds, np.floor(folds)).all():
+        raise ValueError("OOF fold assignments must be finite integers.")
+    return labels, probabilities, folds.astype(int)
+
+
+def _paired_metric_rows(
+    labels: np.ndarray,
+    candidate_scores: np.ndarray,
+    incumbent_scores: np.ndarray,
+    audit_fractions: tuple[float, ...],
+) -> list[dict[str, float | str]]:
+    candidate_metrics = evaluate_probabilities(labels, candidate_scores, audit_fractions)
+    incumbent_metrics = evaluate_probabilities(labels, incumbent_scores, audit_fractions)
+    rows: list[dict[str, float | str]] = []
+    for metric in ("average_precision", "brier_score"):
+        candidate_value = float(candidate_metrics[metric])
+        incumbent_value = float(incumbent_metrics[metric])
+        rows.append(
+            {
+                "metric": metric,
+                "audit_fraction": np.nan,
+                "candidate_value": candidate_value,
+                "incumbent_value": incumbent_value,
+                "delta": candidate_value - incumbent_value,
+            }
+        )
+    for audit_fraction in audit_fractions:
+        candidate_audit = audit_metrics(labels, candidate_scores, audit_fraction)
+        incumbent_audit = audit_metrics(labels, incumbent_scores, audit_fraction)
+        for metric in PAIRED_AUDIT_METRICS:
+            candidate_value = float(candidate_audit[metric])
+            incumbent_value = float(incumbent_audit[metric])
+            rows.append(
+                {
+                    "metric": metric,
+                    "audit_fraction": audit_fraction,
+                    "candidate_value": candidate_value,
+                    "incumbent_value": incumbent_value,
+                    "delta": candidate_value - incumbent_value,
+                }
+            )
+    return rows
+
+
+def _validated_groups(groups: pd.Series, expected_length: int, group_name: str) -> pd.Series:
+    group_series = pd.Series(groups).reset_index(drop=True)
+    if len(group_series) != expected_length:
+        raise ValueError(f"{group_name} groups must have the same length as predictions.")
+    return group_series.rename(group_name)
+
+
+def _fairness_gap_rows(
+    labels: np.ndarray,
+    candidate_scores: np.ndarray,
+    incumbent_scores: np.ndarray,
+    group_variables: Mapping[str, pd.Series],
+    audit_fractions: tuple[float, ...],
+    min_legitimate_count: int,
+) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+    for group_name, groups in group_variables.items():
+        candidate_rates = fairness_across_budgets(
+            groups,
+            labels,
+            candidate_scores,
+            group_name=group_name,
+            audit_fractions=audit_fractions,
+            min_legitimate_count=min_legitimate_count,
+        )
+        incumbent_rates = fairness_across_budgets(
+            groups,
+            labels,
+            incumbent_scores,
+            group_name=group_name,
+            audit_fractions=audit_fractions,
+            min_legitimate_count=min_legitimate_count,
+        )
+        for audit_fraction in audit_fractions:
+            candidate_gap = _fairness_gap(
+                candidate_rates.loc[candidate_rates["audit_fraction"].eq(audit_fraction)]
+            )
+            incumbent_gap = _fairness_gap(
+                incumbent_rates.loc[incumbent_rates["audit_fraction"].eq(audit_fraction)]
+            )
+            rows.append(
+                {
+                    "group_variable": group_name,
+                    "audit_fraction": audit_fraction,
+                    "candidate_gap": candidate_gap,
+                    "incumbent_gap": incumbent_gap,
+                    "delta": candidate_gap - incumbent_gap,
+                }
+            )
+    return rows
+
+
+def _fairness_gap(rates: pd.DataFrame) -> float:
+    eligible = rates.loc[rates["eligible_for_comparison"], "audit_rate"]
+    if eligible.empty:
+        return float("nan")
+    return float(eligible.max() - eligible.min())

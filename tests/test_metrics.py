@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 from prs_its.metrics import (
@@ -6,6 +7,8 @@ from prs_its.metrics import (
     bootstrap_audit_intervals,
     evaluate_probabilities,
     normalized_recall_at_budget,
+    paired_fairness_comparison,
+    paired_oof_comparison,
 )
 
 
@@ -93,3 +96,75 @@ def test_bootstrap_audit_intervals_validate_configuration() -> None:
 
     with pytest.raises(ValueError, match="confidence_level"):
         bootstrap_audit_intervals([0, 1], [0.1, 0.9], confidence_level=1.0)
+
+
+def _paired_oof_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = 120
+    labels = np.arange(rows) % 3 == 0
+    random = np.random.default_rng(42)
+    incumbent_scores = np.clip(0.2 + 0.2 * random.random(rows), 0, 1)
+    candidate_scores = np.where(labels, 0.85, 0.15) + random.normal(0, 0.02, rows)
+    base = pd.DataFrame(
+        {
+            "claim_id": [f"CLM_{index:03d}" for index in range(rows)],
+            "label": labels.astype(int),
+            "fold": np.arange(rows) % 5,
+        }
+    )
+    candidate = base.assign(fraud_probability_raw=np.clip(candidate_scores, 0, 1))
+    incumbent = base.assign(fraud_probability_raw=incumbent_scores)
+    return candidate, incumbent
+
+
+def test_paired_oof_comparison_is_deterministic_and_antisymmetric() -> None:
+    candidate, incumbent = _paired_oof_frames()
+    first = paired_oof_comparison(candidate, incumbent, n_bootstrap=31, random_state=42)
+    second = paired_oof_comparison(candidate, incumbent, n_bootstrap=31, random_state=42)
+    reverse = paired_oof_comparison(incumbent, candidate, n_bootstrap=31, random_state=42)
+
+    pd.testing.assert_frame_equal(first, second)
+    assert {"average_precision", "brier_score", "normalized_recall"} <= set(first["metric"])
+    np.testing.assert_allclose(reverse["delta"], -first["delta"])
+    np.testing.assert_allclose(reverse["ci_lower"], -first["ci_upper"])
+    np.testing.assert_allclose(reverse["ci_upper"], -first["ci_lower"])
+
+
+def test_paired_oof_comparison_rejects_fold_mismatch() -> None:
+    candidate, incumbent = _paired_oof_frames()
+    incumbent.loc[0, "fold"] = 9
+
+    with pytest.raises(ValueError, match="fold assignments"):
+        paired_oof_comparison(candidate, incumbent, n_bootstrap=5)
+
+
+def test_paired_fairness_comparison_reports_rate_deltas_and_handles_no_eligible_groups() -> None:
+    candidate, incumbent = _paired_oof_frames()
+    gender = pd.Series(np.where(np.arange(len(candidate)) % 2, "M", "F"))
+    age_group = pd.Series(np.where(np.arange(len(candidate)) % 3, "18-39", "40-59"))
+    comparison = paired_fairness_comparison(
+        candidate["label"],
+        candidate["fraud_probability_raw"],
+        incumbent["fraud_probability_raw"],
+        gender,
+        age_group,
+        min_legitimate_count=5,
+        n_bootstrap=31,
+        random_state=42,
+    )
+
+    assert set(comparison) == {"subgroup_rate_deltas", "gap_intervals"}
+    assert set(comparison["subgroup_rate_deltas"]["group_variable"]) == {"gender", "age_group"}
+    assert comparison["gap_intervals"]["ci_lower"].notna().all()
+
+    no_eligible = paired_fairness_comparison(
+        candidate["label"],
+        candidate["fraud_probability_raw"],
+        incumbent["fraud_probability_raw"],
+        gender,
+        age_group,
+        min_legitimate_count=1000,
+        n_bootstrap=5,
+        random_state=42,
+    )
+    assert no_eligible["gap_intervals"]["candidate_gap"].isna().all()
+    assert no_eligible["gap_intervals"]["ci_lower"].isna().all()
