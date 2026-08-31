@@ -131,8 +131,8 @@ def test_refined_profile_uses_isolated_outputs_and_iteration_override(tmp_path, 
     )
     assert experiments["params"].str.contains('"iterations": 12').all()
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
-    assert calls[-4:] == [42, 2026, 2718, 42]
-    assert len(calls) == 13
+    assert calls[-3:] == [42, 2026, 42]
+    assert len(calls) == 12
     assert (run_dir / "oof" / "catboost_oof_seed_42.csv").exists()
     assert (run_dir / "metrics" / "catboost_seed_fold_metrics.csv").exists()
     grouped = pd.read_csv(run_dir / "metrics" / "catboost_grouped_robustness.csv")
@@ -183,8 +183,8 @@ def test_ctr_profile_screens_then_confirms_in_an_isolated_run(tmp_path, monkeypa
         6.0,
     }
     assert calls[:10] == [42] * 10
-    assert calls[-4:] == [42, 2026, 2718, 42]
-    assert len(calls) == 14
+    assert calls[-3:] == [42, 2026, 42]
+    assert len(calls) == 13
     assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
     assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
     assert (run_dir / "models" / "catboost_final_config.json").exists()
@@ -241,8 +241,8 @@ def test_frequency_profile_screens_then_confirms_in_an_isolated_run(tmp_path, mo
     } == set(experiments["experiment_name"])
     assert set(experiments["frequency_mode"].dropna()) == {"count", "log_count", "rare_flag"}
     assert calls[:4] == [(42, None), (42, "count"), (42, "log_count"), (42, "rare_flag")]
-    assert calls[-4:] == [(42, "count"), (2026, "count"), (2718, "count"), (42, "count")]
-    assert len(calls) == 8
+    assert calls[-3:] == [(42, "count"), (2026, "count"), (42, "count")]
+    assert len(calls) == 7
     assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
     assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
     with (run_dir / "models" / "catboost_final_config.json").open() as file:
@@ -254,12 +254,8 @@ def test_frequency_profile_screens_then_confirms_in_an_isolated_run(tmp_path, mo
             "catboost_seed_2026_frequency_fold_0.json",
             "catboost_seed_2026_frequency_fold_1.json",
         ],
-        "2718": [
-            "catboost_seed_2718_frequency_fold_0.json",
-            "catboost_seed_2718_frequency_fold_1.json",
-        ],
     }
-    assert len(list((run_dir / "models").glob("catboost_seed_*_frequency_fold_*.json"))) == 6
+    assert len(list((run_dir / "models").glob("catboost_seed_*_frequency_fold_*.json"))) == 4
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
 
 
@@ -302,8 +298,8 @@ def test_clinical_shape_profile_screens_then_confirms_in_an_isolated_run(
         "joint_burden",
     }
     assert calls[:4] == [42] * 4
-    assert calls[-4:] == [42, 2026, 2718, 42]
-    assert len(calls) == 8
+    assert calls[-3:] == [42, 2026, 42]
+    assert len(calls) == 7
     assert (run_dir / "metrics" / "catboost_audit_bootstrap.csv").exists()
     assert (run_dir / "metrics" / "catboost_grouped_robustness_bootstrap.csv").exists()
     with (run_dir / "models" / "catboost_final_config.json").open() as file:
@@ -318,3 +314,7 @@ def test_clinical_shape_profile_screens_then_confirms_in_an_isolated_run(
     }
     assert "secondary_diagnosis_active_group_count" in final_config["features"]
     assert not (tmp_path / "outputs" / "models" / "catboost_final_config.json").exists()
+
+
+def test_parse_ensemble_seeds_preserves_explicit_three_seed_override() -> None:
+    assert training.parse_ensemble_seeds("42,2026,2718") == (42, 2026, 2718)

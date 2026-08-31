@@ -57,6 +57,7 @@ from prs_its.submission import make_submission
 ISOLATED_PROFILES = {"refined", "ctr", "frequency", "clinical-shape"}
 ENSEMBLE_PROFILES = ISOLATED_PROFILES
 BOOTSTRAP_PROFILES = {"ctr", "frequency", "clinical-shape"}
+DEFAULT_ENSEMBLE_SEEDS = (RANDOM_STATE, 2026)
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,7 @@ class TrainingConfig:
     profile: str = "baseline"
     run_name: str | None = None
     iterations: int | None = None
-    ensemble_seeds: tuple[int, ...] = (RANDOM_STATE, 2026, 2718)
+    ensemble_seeds: tuple[int, ...] = DEFAULT_ENSEMBLE_SEEDS
 
 
 @dataclass(frozen=True)
@@ -1320,7 +1321,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--iterations", type=int, default=None)
-    parser.add_argument("--ensemble-seeds", default="42,2026,2718")
+    parser.add_argument(
+        "--ensemble-seeds", default=",".join(str(seed) for seed in DEFAULT_ENSEMBLE_SEEDS)
+    )
     return parser.parse_args()
 
 
