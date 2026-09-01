@@ -174,8 +174,8 @@ def promotion_decision(
         average_precision["delta"] >= -AVERAGE_PRECISION_TOLERANCE
     )
     brier_noninferior = bool(brier["delta"] <= 0)
-    gender_fairness_not_regressed = bool(gender_fairness["ci_lower"] <= 0)
-    age_fairness_not_regressed = bool(age_fairness["ci_lower"] <= 0)
+    gender_fairness_not_regressed = _fairness_not_regressed(gender_fairness)
+    age_fairness_not_regressed = _fairness_not_regressed(age_fairness)
     return PromotionDecision(
         promoted=(
             normalized_recall_positive
@@ -258,9 +258,12 @@ def _fairness_gap_row(comparison: pd.DataFrame, group_variable: str) -> pd.Serie
     if len(rows) != 1:
         raise ValueError(f"Fairness comparison must contain one {group_variable!r} gap row.")
     row = rows.iloc[0]
-    if not np.isfinite(float(row["ci_lower"])):
-        raise ValueError(f"Fairness comparison contains an invalid {group_variable!r} gap interval.")
     return row
+
+
+def _fairness_not_regressed(row: pd.Series) -> bool:
+    ci_lower = float(row["ci_lower"])
+    return bool(np.isfinite(ci_lower) and ci_lower <= 0)
 
 
 def _validated_probabilities(

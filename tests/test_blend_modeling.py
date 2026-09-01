@@ -93,3 +93,8 @@ def test_promotion_requires_each_predeclared_gate() -> None:
     rejected = promotion_decision(paired, fairness)
     assert not rejected.promoted
     assert not rejected.age_fairness_not_regressed
+
+    fairness.loc[fairness["group_variable"].eq("age_group"), "ci_lower"] = np.nan
+    undefined = promotion_decision(paired, fairness)
+    assert not undefined.promoted
+    assert not undefined.age_fairness_not_regressed
