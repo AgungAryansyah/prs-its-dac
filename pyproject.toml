@@ -17,6 +17,9 @@ dependencies = [
     "scikit-learn>=1.6",
     "tqdm>=4.67",
     "xgboost>=3.4.1",
+    "torch>=2.13.0",
+    "tabm>=0.0.3",
+    "rtdl-num-embeddings>=0.0.12",
 ]
 
 [dependency-groups]
