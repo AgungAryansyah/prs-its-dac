@@ -32,6 +32,7 @@ prs-its = "prs_its:main"
 prs-its-train = "prs_its.training:main"
 prs-its-xgb-train = "prs_its.xgb_training:main"
 prs-its-blend-train = "prs_its.blend_training:main"
+prs-its-history-train = "prs_its.history_training:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

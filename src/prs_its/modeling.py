@@ -469,6 +469,7 @@ def train_catboost_cv(
     groups: np.ndarray | pd.Series | None = None,
     predict_test: bool = True,
     fold_transformer_factory: Callable[[], FrequencyFeatureTransformer] | None = None,
+    require_complete_oof: bool = True,
 ) -> dict[str, Any]:
     if task_type not in {"CPU", "GPU"}:
         raise ValueError("task_type must be CPU or GPU.")
@@ -483,7 +484,7 @@ def train_catboost_cv(
     _validate_weighting(model_params)
     model_params.update({"task_type": task_type, "devices": devices})
     y = pd.Series(y, index=X.index, dtype=int)
-    oof_pred = np.zeros(len(X), dtype=float)
+    oof_pred = np.full(len(X), np.nan, dtype=float)
     fold_id = np.full(len(X), -1, dtype=int)
     test_fold_predictions: list[np.ndarray] = []
     fold_metrics: list[dict[str, Any]] = []
@@ -580,9 +581,14 @@ def train_catboost_cv(
         if progress_callback is not None:
             progress_callback("complete", fold)
 
-    if (fold_id < 0).any():
+    if require_complete_oof and (fold_id < 0).any():
         raise RuntimeError("Every training row must receive exactly one OOF prediction.")
-    if not np.isfinite(oof_pred).all() or not ((0 <= oof_pred) & (oof_pred <= 1)).all():
+    evaluated = fold_id >= 0
+    if not evaluated.any():
+        raise RuntimeError("Cross-validation did not assign any OOF predictions.")
+    if not np.isfinite(oof_pred[evaluated]).all() or not (
+        (0 <= oof_pred[evaluated]) & (oof_pred[evaluated] <= 1)
+    ).all():
         raise RuntimeError("OOF predictions must be finite probabilities.")
     test_fold_predictions_array = np.vstack(test_fold_predictions) if predict_test else None
     test_pred = np.mean(test_fold_predictions_array, axis=0) if predict_test else None
