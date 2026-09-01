@@ -318,11 +318,11 @@ def run_xgb_training(config: XGBTrainingConfig) -> dict[str, Any]:
         raw_oof_pred,
         config.n_bootstrap,
     )
-    submission_path = paths["submissions"] / "xgb_target_encoding_submission.csv"
+    submission_path = paths["submissions"] / f"{selected_name}_submission.csv"
     submission = make_submission(test[ID_COL], final_test_pred, submission_path)
     raw_submission_path = None
     if calibration_method != "raw":
-        raw_submission_path = paths["submissions"] / "xgb_target_encoding_raw_submission.csv"
+        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_submission.csv"
         make_submission(test[ID_COL], raw_test_pred, raw_submission_path)
     return {
         "selected_experiment": selected_name,

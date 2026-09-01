@@ -152,7 +152,8 @@ def test_xgb_training_stages_and_writes_only_to_its_run(tmp_path, monkeypatch) -
     assert (run_dir / "oof" / "xgb_oof_seed_2026.csv").exists()
     assert (run_dir / "metrics" / "xgb_vs_ctr_seed_42_paired.csv").exists()
     assert (run_dir / "metrics" / "xgb_vs_ctr_ensemble_fairness_gaps.csv").exists()
-    assert (run_dir / "submissions" / "xgb_target_encoding_submission.csv").exists()
+    assert result["submission_path"] == run_dir / "submissions" / "te_xgb_support_submission.csv"
+    assert result["submission_path"].exists()
     assert not (tmp_path / "outputs" / "models" / "xgb_final_config.json").exists()
     with (run_dir / "models" / "xgb_final_config.json").open() as file:
         final_config = json.load(file)
