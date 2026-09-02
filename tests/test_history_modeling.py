@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,6 +14,8 @@ from prs_its.history_modeling import (
     build_causal_history_features,
     history_provider_groups,
     load_claim_history,
+    load_history_column_map,
+    map_claim_history_columns,
     validate_claim_history,
 )
 from prs_its.modeling import FeatureSpec, PreparedFeatures
@@ -180,6 +184,82 @@ def test_claim_history_loader_reads_csv_and_preserves_current_order(tmp_path) ->
 
     assert loaded["claim_id"].tolist() == history["claim_id"].tolist()
     assert str(loaded["event_at"].dtype).startswith("datetime64")
+
+
+def test_claim_history_column_map_renames_columns_and_normalizes_labels(tmp_path) -> None:
+    train, test, history = _competition_and_history()
+    source_columns = {column: f"source_{column}" for column in history.columns}
+    source = history.rename(columns=source_columns)
+    source["source_adjudicated_label"] = source["source_adjudicated_label"].map(
+        {0: "legitimate", 1: "fraud"}
+    )
+    source_path = tmp_path / "mapped_history.csv"
+    source.to_csv(source_path, index=False)
+    map_path = tmp_path / "history_column_map.json"
+    map_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "columns": {
+                    column: source_columns[column]
+                    for column in history.columns
+                },
+                "label_values": {"legitimate": 0, "fraud": 1},
+            }
+        )
+    )
+
+    loaded = load_claim_history(source_path, train, test, map_path)
+
+    assert loaded.columns.tolist() == list(history.columns)
+    assert loaded.loc[loaded["claim_id"].eq("TRN_0"), "adjudicated_label"].item() == 0
+    assert loaded.loc[loaded["claim_id"].eq("TRN_1"), "adjudicated_label"].item() == 1
+
+
+def test_claim_history_column_map_rejects_absent_or_duplicate_sources(tmp_path) -> None:
+    absent_path = tmp_path / "absent.json"
+    absent_path.write_text(
+        json.dumps({"version": 1, "columns": {"claim_id": "missing_claim_id"}})
+    )
+    mapping = load_history_column_map(absent_path)
+    with pytest.raises(ValueError, match="unavailable source columns"):
+        map_claim_history_columns(pd.DataFrame({"claim_id": ["A"]}), mapping)
+
+    duplicate_path = tmp_path / "duplicate.json"
+    duplicate_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "columns": {"claim_id": "source_claim_id", "patient_id": "source_claim_id"},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="more than once"):
+        load_history_column_map(duplicate_path)
+
+
+def test_claim_history_column_map_preserves_id_and_temporal_rejections(tmp_path) -> None:
+    train, test, history = _competition_and_history()
+    source_columns = {column: f"source_{column}" for column in history.columns}
+    source = history.rename(columns=source_columns)
+    source_path = tmp_path / "mapped_history.csv"
+    map_path = tmp_path / "history_column_map.json"
+    map_path.write_text(
+        json.dumps(
+            {"version": 1, "columns": {column: source_columns[column] for column in history.columns}}
+        )
+    )
+
+    source.loc[source["source_claim_id"].eq("TRN_0"), "source_claim_id"] = "OTHER"
+    source.to_csv(source_path, index=False)
+    with pytest.raises(ValueError, match="missing current competition"):
+        load_claim_history(source_path, train, test, map_path)
+
+    source = history.rename(columns=source_columns)
+    source.loc[source["source_claim_id"].eq("TST_0"), "source_event_at"] = "2025-01-09T00:00:00Z"
+    source.to_csv(source_path, index=False)
+    with pytest.raises(ValueError, match="after every current training"):
+        load_claim_history(source_path, train, test, map_path)
 
 
 def test_claim_history_rejects_test_outcomes_and_noncausal_test_time() -> None:

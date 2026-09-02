@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "columns": {
+    "claim_id": "claim_id",
+    "event_at": "event_at",
+    "adjudicated_at": "adjudicated_at",
+    "provider_id": "provider_id",
+    "patient_id": "patient_id",
+    "claim_amount": "claim_amount",
+    "tariff_amount": "tariff_amount",
+    "adjudicated_label": "adjudicated_label",
+    "kdkc": "kdkc",
+    "typeppk": "typeppk",
+    "cmg": "cmg",
+    "severitylevel": "severitylevel",
+    "diagprimer": "diagprimer"
+  },
+  "label_values": {
+    "0": 0,
+    "1": 1
+  }
+}

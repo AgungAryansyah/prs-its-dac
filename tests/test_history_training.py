@@ -158,6 +158,35 @@ def test_catboost_cv_allows_a_partial_temporal_oof_cohort() -> None:
     assert np.isfinite(result["oof_pred"][4:]).all()
 
 
+def test_history_preflight_reports_temporal_and_prior_coverage_without_a_run(tmp_path) -> None:
+    train, _ = _write_project(tmp_path)
+    history_path = tmp_path / "history.csv"
+    history = pd.read_csv(history_path)
+    prior = history.iloc[[0]].copy()
+    prior["claim_id"] = "HIST_000"
+    prior["event_at"] = "2024-12-01 00:00:00+00:00"
+    prior["adjudicated_at"] = "2024-12-02 00:00:00+00:00"
+    prior["adjudicated_label"] = 1
+    pd.concat([prior, history], ignore_index=True).to_csv(history_path, index=False)
+
+    report = history_training.preflight_history(
+        history_training.HistoryTrainingConfig(
+            project_root=tmp_path,
+            history_path=history_path,
+            run_name="preflight-only",
+            task_type="CPU",
+            n_splits=2,
+            show_progress=False,
+        )
+    )
+
+    assert report["coverage"]["matched_current_train_claims"] == len(train)
+    assert report["prior_history"]["available"] is True
+    assert report["temporal_eligibility"]["eligible"] is True
+    assert report["ready_to_train"] is True
+    assert not (tmp_path / "outputs" / "runs" / "preflight-only").exists()
+
+
 def test_history_training_runs_all_stages_without_writing_baseline_paths(tmp_path, monkeypatch) -> None:
     train, _ = _write_project(tmp_path)
     calls = []

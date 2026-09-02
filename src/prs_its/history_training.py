@@ -79,6 +79,7 @@ class HistoryTrainingConfig:
     project_root: Path
     history_path: Path
     run_name: str
+    history_column_map_path: Path | None = None
     task_type: str = "GPU"
     devices: str = "0"
     n_splits: int = N_SPLITS
@@ -216,6 +217,31 @@ def history_output_paths(project_root: Path, run_name: str) -> dict[str, Path]:
     return paths
 
 
+def preflight_history(config: HistoryTrainingConfig) -> dict[str, Any]:
+    if config.n_splits < 2:
+        raise ValueError("n_splits must be at least 2.")
+    train, test = load_competition_data(config.project_root)
+    features = validate_train_test_schema(train, test)
+    if ID_COL in features or TARGET in features:
+        raise RuntimeError("claim_id and label must not be model features.")
+    history_path = _project_path(config.project_root, config.history_path)
+    column_map_path = (
+        None
+        if config.history_column_map_path is None
+        else _project_path(config.project_root, config.history_column_map_path)
+    )
+    history = load_claim_history(history_path, train, test, column_map_path)
+    return _history_preflight_report(
+        history,
+        train,
+        test,
+        config.n_splits,
+        config.warmup_fraction,
+        history_path,
+        column_map_path,
+    )
+
+
 def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
     task_type = config.task_type.upper()
     if task_type not in {"CPU", "GPU"}:
@@ -231,12 +257,13 @@ def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
     features = validate_train_test_schema(train, test)
     if ID_COL in features or TARGET in features:
         raise RuntimeError("claim_id and label must not be model features.")
-    history_path = (
-        config.history_path
-        if config.history_path.is_absolute()
-        else config.project_root / config.history_path
+    history_path = _project_path(config.project_root, config.history_path)
+    column_map_path = (
+        None
+        if config.history_column_map_path is None
+        else _project_path(config.project_root, config.history_column_map_path)
     )
-    history = load_claim_history(history_path, train, test)
+    history = load_claim_history(history_path, train, test, column_map_path)
     bundle = build_causal_history_features(history)
     static_prepared = _prepare_ctr_features(train, test)
     experiments = _history_experiments(static_prepared, train, test, bundle)
@@ -448,6 +475,88 @@ def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
         }
     finally:
         progress.close()
+
+
+def _project_path(project_root: Path, path: Path) -> Path:
+    return path if path.is_absolute() else project_root / path
+
+
+def _history_preflight_report(
+    history: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    n_splits: int,
+    warmup_fraction: float,
+    history_path: Path,
+    column_map_path: Path | None,
+) -> dict[str, Any]:
+    train_ids = train[ID_COL].astype("string").astype(str).to_numpy()
+    test_ids = test[ID_COL].astype("string").astype(str).to_numpy()
+    current_ids = set(train_ids) | set(test_ids)
+    indexed = history.set_index(ID_COL)
+    prior = history.loc[~history[ID_COL].isin(current_ids)].copy()
+    prior_adjudicated = prior.loc[prior["adjudicated_label"].notna()].copy()
+    adjudicated_times = prior_adjudicated["adjudicated_at"].to_numpy()
+
+    def available_before(claim_ids: np.ndarray) -> int:
+        events = indexed.loc[claim_ids, "event_at"].to_numpy()
+        return int(sum(bool(np.any(adjudicated_times < event)) for event in events))
+
+    temporal_folds: list[dict[str, Any]] = []
+    temporal_error: str | None = None
+    try:
+        temporal_cv = RollingOriginCV(
+            indexed.loc[train_ids, "event_at"],
+            indexed.loc[train_ids, "adjudicated_at"],
+            n_splits=n_splits,
+            warmup_fraction=warmup_fraction,
+        )
+        temporal_cv.validate_labels(train[TARGET])
+        temporal_folds = [
+            {
+                "fold": fold.fold,
+                "train_rows": int(len(fold.train_idx)),
+                "validation_rows": int(len(fold.valid_idx)),
+                "validation_start": fold.validation_start.isoformat(),
+            }
+            for fold in temporal_cv.folds
+        ]
+    except ValueError as error:
+        temporal_error = str(error)
+
+    train_prior_coverage = available_before(train_ids)
+    test_prior_coverage = available_before(test_ids)
+    temporal_eligible = temporal_error is None
+    prior_history_available = bool(len(prior_adjudicated))
+    return {
+        "history_path": str(history_path),
+        "history_column_map_path": None if column_map_path is None else str(column_map_path),
+        "history_rows": int(len(history)),
+        "coverage": {
+            "current_train_claims": int(len(train_ids)),
+            "current_test_claims": int(len(test_ids)),
+            "matched_current_train_claims": int(len(indexed.loc[train_ids])),
+            "matched_current_test_claims": int(len(indexed.loc[test_ids])),
+        },
+        "prior_history": {
+            "rows": int(len(prior)),
+            "adjudicated_rows": int(len(prior_adjudicated)),
+            "current_train_claims_with_prior_adjudicated_history": train_prior_coverage,
+            "current_test_claims_with_prior_adjudicated_history": test_prior_coverage,
+            "available": prior_history_available,
+        },
+        "temporal_eligibility": {
+            "eligible": temporal_eligible,
+            "reason": temporal_error,
+            "evaluation_rows": int(
+                sum(fold["validation_rows"] for fold in temporal_folds)
+            ),
+            "folds": temporal_folds,
+        },
+        "ready_to_train": bool(
+            temporal_eligible and prior_history_available and train_prior_coverage > 0
+        ),
+    }
 
 
 def _prepare_ctr_features(train: pd.DataFrame, test: pd.DataFrame) -> PreparedFeatures:
@@ -1024,8 +1133,10 @@ def parse_args() -> argparse.Namespace:
         description="Train the causal history-enriched CatBoost challenger."
     )
     parser.add_argument("--project-root", type=Path, default=None)
-    parser.add_argument("--run-name", required=True)
+    parser.add_argument("--run-name")
     parser.add_argument("--history-path", type=Path, required=True)
+    parser.add_argument("--history-column-map", type=Path, default=None)
+    parser.add_argument("--preflight", action="store_true")
     parser.add_argument(
         "--task-type",
         choices=["CPU", "GPU"],
@@ -1038,16 +1149,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    result = run_history_training(
-        HistoryTrainingConfig(
-            project_root=find_project_root(args.project_root),
-            history_path=args.history_path,
-            run_name=args.run_name,
-            task_type=args.task_type,
-            show_progress=not args.quiet,
-            catboost_verbose=args.catboost_verbose,
-        )
+    config = HistoryTrainingConfig(
+        project_root=find_project_root(args.project_root),
+        history_path=args.history_path,
+        run_name=args.run_name or "preflight",
+        history_column_map_path=args.history_column_map,
+        task_type=args.task_type,
+        show_progress=not args.quiet,
+        catboost_verbose=args.catboost_verbose,
     )
+    if args.preflight:
+        result = preflight_history(config)
+    else:
+        if args.run_name is None:
+            raise ValueError("--run-name is required unless --preflight is used.")
+        result = run_history_training(config)
     print(json.dumps(result, indent=2, default=str))
 
 

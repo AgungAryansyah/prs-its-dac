@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ HISTORY_REQUIRED_COLUMNS = (
     "severitylevel",
     "diagprimer",
 )
+HISTORY_COLUMN_MAP_VERSION = 1
 HISTORY_CONTEXT_COLUMNS = ("kdkc", "typeppk", "cmg", "severitylevel", "diagprimer")
 HISTORY_FINANCIAL_FEATURES = (
     "history_claim_amount",
@@ -94,6 +96,13 @@ class HistoryFeatureBundle:
     feature_groups: dict[str, tuple[str, ...]]
 
 
+@dataclass(frozen=True)
+class HistoryColumnMap:
+    version: int
+    columns: dict[str, str]
+    label_values: dict[str, int] | None = None
+
+
 @dataclass
 class _RollingCount:
     total: int = 0
@@ -154,6 +163,7 @@ def load_claim_history(
     path: Path,
     train: pd.DataFrame,
     test: pd.DataFrame,
+    column_map_path: Path | None = None,
 ) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Claim-history file does not exist: {path}")
@@ -163,7 +173,65 @@ def load_claim_history(
         history = pd.read_parquet(path)
     else:
         raise ValueError("history_path must be a CSV or Parquet file.")
+    if column_map_path is not None:
+        history = map_claim_history_columns(history, load_history_column_map(column_map_path))
     return validate_claim_history(history, train, test)
+
+
+def load_history_column_map(path: Path) -> HistoryColumnMap:
+    if not path.exists():
+        raise FileNotFoundError(f"Claim-history column-map file does not exist: {path}")
+    try:
+        with path.open() as file:
+            payload = json.load(file)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Claim-history column-map must be valid JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Claim-history column-map must be a JSON object.")
+    if payload.get("version") != HISTORY_COLUMN_MAP_VERSION:
+        raise ValueError(
+            f"Claim-history column-map version must be {HISTORY_COLUMN_MAP_VERSION}."
+        )
+    raw_columns = payload.get("columns", {})
+    if not isinstance(raw_columns, dict):
+        raise ValueError("Claim-history column-map columns must be a JSON object.")
+    unknown = sorted(set(raw_columns) - set(HISTORY_REQUIRED_COLUMNS))
+    if unknown:
+        raise ValueError(f"Claim-history column-map has unknown canonical columns: {unknown}")
+    columns = {column: column for column in HISTORY_REQUIRED_COLUMNS}
+    for canonical, source in raw_columns.items():
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(f"Claim-history column-map source for {canonical} must be non-empty.")
+        columns[canonical] = source.strip()
+    duplicate_sources = {
+        source: [canonical for canonical, mapped in columns.items() if mapped == source]
+        for source in set(columns.values())
+    }
+    duplicates = {source: names for source, names in duplicate_sources.items() if len(names) > 1}
+    if duplicates:
+        raise ValueError(f"Claim-history column-map maps source columns more than once: {duplicates}")
+    return HistoryColumnMap(
+        version=HISTORY_COLUMN_MAP_VERSION,
+        columns=columns,
+        label_values=_history_label_values(payload.get("label_values")),
+    )
+
+
+def map_claim_history_columns(history: pd.DataFrame, column_map: HistoryColumnMap) -> pd.DataFrame:
+    if history.columns.duplicated().any():
+        raise ValueError("Claim-history source columns must be unique before mapping.")
+    missing = sorted(set(column_map.columns.values()) - set(history.columns))
+    if missing:
+        raise ValueError(
+            f"Claim-history column-map references unavailable source columns: {missing}"
+        )
+    mapped = history.loc[:, [column_map.columns[column] for column in HISTORY_REQUIRED_COLUMNS]].copy()
+    mapped.columns = HISTORY_REQUIRED_COLUMNS
+    if column_map.label_values is not None:
+        mapped["adjudicated_label"] = _normalize_mapped_labels(
+            mapped["adjudicated_label"], column_map.label_values
+        )
+    return mapped
 
 
 def validate_claim_history(
@@ -673,6 +741,46 @@ def _labels(values: pd.Series) -> pd.Series:
     if invalid.any():
         raise ValueError("adjudicated_label must contain only 0, 1, or empty values.")
     return numeric.astype("Int64")
+
+
+def _history_label_values(values: object) -> dict[str, int] | None:
+    if values is None:
+        return None
+    if not isinstance(values, dict) or not values:
+        raise ValueError("Claim-history column-map label_values must be a non-empty JSON object.")
+    normalized: dict[str, int] = {}
+    for source, target in values.items():
+        key = _label_value_key(source)
+        if not key:
+            raise ValueError("Claim-history column-map label_values keys must be non-empty.")
+        try:
+            normalized_target = int(target)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Claim-history column-map label_values must normalize to 0 or 1.") from error
+        if normalized_target not in {0, 1}:
+            raise ValueError("Claim-history column-map label_values must normalize to 0 or 1.")
+        if key in normalized:
+            raise ValueError(f"Claim-history column-map repeats label value: {key!r}")
+        normalized[key] = normalized_target
+    return normalized
+
+
+def _normalize_mapped_labels(values: pd.Series, label_values: dict[str, int]) -> pd.Series:
+    normalized = pd.Series(pd.NA, index=values.index, dtype="Int64")
+    observed = values.loc[values.notna()]
+    missing = sorted({_label_value_key(value) for value in observed if _label_value_key(value) not in label_values})
+    if missing:
+        raise ValueError(
+            f"Claim-history column-map does not normalize source label values: {missing}"
+        )
+    normalized.loc[observed.index] = [label_values[_label_value_key(value)] for value in observed]
+    return normalized
+
+
+def _label_value_key(value: object) -> str:
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and float(value).is_integer():
+        return str(int(value))
+    return str(value).strip()
 
 
 def _amounts(values: pd.Series, name: str) -> pd.Series:
