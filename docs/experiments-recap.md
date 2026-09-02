@@ -1,6 +1,6 @@
 # Experiment Recap
 
-Updated: 2026-09-02
+Updated: 2026-09-01
 
 This log separates experiments with saved run artifacts from experiments that are
 implemented but have not yet been run. Metrics are OOF estimates, not public
@@ -30,7 +30,6 @@ than one seed.
 | `clinical-shape-v1` | `clinical_shape_concentration` | Two-seed result: 7,816 @5%; AP 0.830119; Brier 0.169413 | Narrow cutoff alternative, not default | [findings](../outputs/runs/clinical-shape-v1/metrics/catboost_final_findings.csv) |
 | `xgb-v1` | `te_xgb_support` | Matched-seed AP 0.806620; Brier 0.178927; 7,676 @5% | Not competitive with CTR | [paired comparison](../outputs/runs/xgb-v1/metrics/xgb_vs_ctr_ensemble_paired.csv) |
 | `ctr-xgb-blend-v1` | `ctr_xgb_raw_w02` | Small screen gain did not survive fresh confirmation | Rejected; no promoted submission | [decision](../outputs/runs/ctr-xgb-blend-v1/metrics/promotion_decision.json) |
-| `tabm-v1` | `tabm_piecewise_ctr_blend_w30` | AP 0.832558; Brier 0.168178; 7,818 @5% | Rejected: +7 @5% was neither meaningful nor statistically positive | [paired comparison](../outputs/runs/tabm-v1/metrics/tabm_piecewise_ctr_blend_w30_ensemble_vs_ctr_paired.csv) |
 
 ## Detailed experiment record
 
@@ -187,49 +186,21 @@ Source: [blend screen](../outputs/runs/ctr-xgb-blend-v1/metrics/blend_experiment
 The selected 2% blend is an example of why fresh confirmation matters: its tiny
 screen gain did not reproduce, and the saved decision correctly rejects promotion.
 
-### TabM challenger (`tabm-v1`)
-
-This tested a fold-safe TabM base model and piecewise-linear numeric embeddings,
-then predeclared raw and 5–30% TabM blends with matched CTR OOF predictions. Raw
-TabM was weaker than CTR: the piecewise raw run reached AP 0.818622, Brier
-0.173814, and 7,703 fraud claims caught at 5%. The 30% piecewise blend improved
-full-vector quality and was selected for confirmation.
-
-| Configuration | AP | Brier | Fraud caught @5% | Decision |
-|---|---:|---:|---:|---|
-| `ctr_control_raw` screen control | 0.829085 | 0.169928 | 7,804 | Incumbent screen reference |
-| `tabm_piecewise_raw` | 0.818622 | 0.173814 | 7,703 | Weaker raw challenger |
-| `tabm_piecewise_ctr_blend_w30` screen | 0.831475 | 0.168678 | 7,809 | Selected for confirmation |
-| `tabm_piecewise_ctr_blend_w30` two-seed ensemble | 0.832558 | 0.168178 | 7,818 | +7 at 5% versus matched CTR |
-
-The ensemble improved AP by 0.002227 and Brier by 0.001166 versus matched CTR,
-but the 5% capture interval was -11 to +21 claims. It therefore failed both the
-minimum +20-capture rule and the statistically positive capture requirement, even
-though the fresh seed was non-inferior. Raw calibration was retained because neither
-cross-fitted alternative improved its Brier score.
-
-Source: [experiment table](../outputs/runs/tabm-v1/metrics/tabm_experiments.csv),
-[paired comparison](../outputs/runs/tabm-v1/metrics/tabm_piecewise_ctr_blend_w30_ensemble_vs_ctr_paired.csv),
-[calibration result](../outputs/runs/tabm-v1/metrics/tabm_piecewise_ctr_blend_w30_calibration_metrics.csv), and
-[promotion decision](../outputs/runs/tabm-v1/metrics/tabm_promotion_decision.json).
-
-The model and preprocessor artifacts are intentionally retained on the remote
-training server and are not mirrored in this local artifact export.
-
 ## Implemented but not yet executed
 
-The following suites are implemented but have no completed result yet.
+No `outputs/runs/history-*` or `outputs/runs/tabm-*` directory exists as of this
+recap. The following suites are ready to run but are not completed experiments and
+have no performance claim yet.
 
 | Suite | Planned screen | Purpose | References |
 |---|---|---|---|
 | Causal history CatBoost | `history_static_control`, `history_financial`, `history_behavioral`, `history_adjudication` | Adds time-available financial, provider/patient-behaviour, and adjudication signals using rolling-origin validation; it requires an external history file and rejects post-event leakage. | [feature builder](../src/prs_its/history_modeling.py), [command](../src/prs_its/history_training.py), commits `90817bc`, `2bf95da` |
-| TabM HPO challenger | 15 seeded TPE trials each for `k=16` and `k=32`, then raw and fixed 5–50% CTR blends | Tunes only the piecewise family, persists resumable SQLite studies, checks the largest GPU configuration, and retains the same confirmation and promotion gates. | [HPO command](../src/prs_its/tabm_tuning.py), [fold-safe CV](../src/prs_its/tabm_modeling.py), [Gorishniy et al., 2025](https://openreview.net/forum?id=Sd4wYYOhmY) |
+| TabM challenger | `tabm_base`, `tabm_piecewise`, raw candidates, and fixed 5–30% CTR blends | Uses train-fold categorical indices, normalized or piecewise numeric inputs, inner early stopping, paired CTR comparison, fairness, grouped robustness, calibration, and a meaningful-capture promotion gate. | [fold-safe CV](../src/prs_its/tabm_modeling.py), [command](../src/prs_its/tabm_training.py), [Gorishniy et al., 2025](https://openreview.net/forum?id=Sd4wYYOhmY), commits `e5e922d`, `d840fcf` |
 
 ## Current conclusion
 
 `ctr-v1` with `dati2_typeppk` remains the strongest general, reproducible incumbent.
 Frequency variants were ruled out, clinical shape is a small cutoff-specific trade-off,
-target-encoded XGBoost was not competitive, and `tabm-v1` did not clear its
-capture-promotion gate. Causal history and TabM HPO should only be considered
-improvements if their paired, fresh-seed, fairness, and grouped-CV gates show a
-meaningful gain over CTR.
+and target-encoded XGBoost was not competitive. Causal history and TabM should only
+be considered improvements if their paired, fresh-seed, fairness, and grouped-CV gates
+show a meaningful gain over CTR.
