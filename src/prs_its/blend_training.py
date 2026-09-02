@@ -102,21 +102,6 @@ def run_blend_training(config: BlendTrainingConfig) -> dict[str, Any]:
     screen = _run_screen(paths, sources, train, config.n_bootstrap)
     screen["results"].to_csv(paths["metrics"] / "blend_experiments.csv", index=False)
     _save_screen_comparisons(paths, screen, train, config.n_bootstrap)
-    if not screen["decision"].eligible:
-        decision = {
-            "status": "screen_rejected",
-            "screen": screen["decision"].as_dict(),
-            "submission_path": None,
-        }
-        _save_final_config(paths, config, sources, decision, None, "not_run")
-        _save_decision(paths, decision)
-        return {
-            "status": "screen_rejected",
-            "selected_experiment": screen["decision"].selected_name,
-            "selected_weight": screen["decision"].selected_weight,
-            "submission_path": None,
-        }
-
     gpu_status = ensure_xgb_gpu_ready() if task_type == "GPU" else "CPU explicitly selected"
     confirmation = _run_confirmation(
         paths, sources, train, test, config, task_type, screen["decision"]
@@ -133,25 +118,39 @@ def run_blend_training(config: BlendTrainingConfig) -> dict[str, Any]:
         paths["metrics"] / f"{confirmation['name']}_vs_ctr_confirmation_fairness_gaps.csv",
         index=False,
     )
+    confirmation_promoted = bool(confirmation["decision"].promoted)
+    promoted = bool(screen["decision"].eligible and confirmation_promoted)
+    status = (
+        "promoted"
+        if promoted
+        else "screen_rejected"
+        if not screen["decision"].eligible
+        else "confirmation_rejected"
+    )
     decision = {
-        "status": "promoted" if confirmation["decision"].promoted else "confirmation_rejected",
+        "status": status,
+        "promoted": promoted,
+        "confirmation_promoted": confirmation_promoted,
         "screen": screen["decision"].as_dict(),
         "confirmation": confirmation["decision"].as_dict(),
         "selected_experiment": confirmation["name"],
         "selected_weight": confirmation["weight"],
     }
-    submission_path = None
-    if confirmation["decision"].promoted:
-        submission_path = _save_promoted_submission(paths, sources, confirmation, train, test)
-        decision["submission_path"] = str(submission_path)
-    else:
-        decision["submission_path"] = None
+    submission_path = _save_submission(paths, sources, confirmation, train, test, promoted)
+    decision.update(
+        {
+            "submission_status": "promoted" if promoted else "unpromoted",
+            "submission_path": str(submission_path),
+        }
+    )
     _save_final_config(paths, config, sources, decision, confirmation, gpu_status)
     _save_decision(paths, decision)
     return {
         "status": decision["status"],
         "selected_experiment": confirmation["name"],
         "selected_weight": confirmation["weight"],
+        "promoted": promoted,
+        "submission_status": decision["submission_status"],
         "submission_path": submission_path,
     }
 
@@ -359,12 +358,13 @@ def _train_confirmation_xgb(
     return result
 
 
-def _save_promoted_submission(
+def _save_submission(
     paths: dict[str, Path],
     sources: BlendSourceArtifacts,
     confirmation: dict[str, Any],
     train: pd.DataFrame,
     test: pd.DataFrame,
+    promoted: bool,
 ) -> Path:
     ctr_test_by_seed = reconstruct_ctr_test_predictions(sources, train, test)
     xgb_test_by_seed = {
@@ -378,7 +378,8 @@ def _save_promoted_submission(
     pd.DataFrame(
         {ID_COL: test[ID_COL], "fraud_probability_raw": probabilities}
     ).to_csv(paths["oof"] / f"{name}_test_raw.csv", index=False)
-    submission_path = paths["submissions"] / f"{name}_submission.csv"
+    submission_kind = "submission" if promoted else "unpromoted_submission"
+    submission_path = paths["submissions"] / f"{name}_{submission_kind}.csv"
     make_submission(test[ID_COL], probabilities, submission_path)
     return submission_path
 

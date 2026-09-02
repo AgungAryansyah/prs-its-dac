@@ -253,38 +253,6 @@ def run_tabm_training(config: TabMTrainingConfig) -> dict[str, Any]:
             }
         )
         _save_json(paths["metrics"] / "tabm_screen_decision.json", screen_decision)
-        if not screen_decision["eligible"]:
-            decision = {
-                "selected_experiment": selected_name,
-                "selected_variant": selected_variant,
-                "tabm_weight": selected_weight,
-                "promoted": False,
-                "reason": "The selected TabM candidate did not clear the CTR screen guardrails.",
-                "screen": screen_decision,
-            }
-            _save_json(paths["metrics"] / "tabm_promotion_decision.json", decision)
-            _save_final_config(
-                paths,
-                config,
-                source,
-                experiments_by_variant[selected_variant],
-                selected_name,
-                selected_weight,
-                {SCREEN_SEED: screen_runs[selected_variant]},
-                None,
-                gpu_status,
-                decision,
-                None,
-            )
-            return {
-                "selected_experiment": selected_name,
-                "selected_variant": selected_variant,
-                "tabm_weight": selected_weight,
-                "promoted": False,
-                "submission_path": None,
-                "screen_decision": screen_decision,
-            }
-
         selected_experiment = experiments_by_variant[selected_variant]
         selected_seed_runs = {SCREEN_SEED: screen_runs[selected_variant]}
         progress.set_description("Confirmation seed 2026")
@@ -371,38 +339,17 @@ def run_tabm_training(config: TabMTrainingConfig) -> dict[str, Any]:
             config.n_bootstrap,
         )
         decision = _promotion_decision(ensemble_comparison, ensemble_fairness, fresh_comparison)
+        confirmation_promoted = bool(decision["promoted"])
         decision.update(
             {
                 "selected_experiment": selected_name,
                 "selected_variant": selected_variant,
                 "tabm_weight": selected_weight,
                 "screen": screen_decision,
+                "confirmation_promoted": confirmation_promoted,
+                "promoted": confirmation_promoted and bool(screen_decision["eligible"]),
             }
         )
-        _save_json(paths["metrics"] / "tabm_promotion_decision.json", decision)
-        _save_final_config(
-            paths,
-            config,
-            source,
-            selected_experiment,
-            selected_name,
-            selected_weight,
-            selected_seed_runs | {CONFIRMATION_SEED: fresh_run},
-            grouped_run,
-            gpu_status,
-            decision,
-            calibration,
-        )
-        if not decision["promoted"]:
-            return {
-                "selected_experiment": selected_name,
-                "selected_variant": selected_variant,
-                "tabm_weight": selected_weight,
-                "promoted": False,
-                "submission_path": None,
-                "promotion_decision": decision,
-            }
-
         all_seed_runs = {**selected_seed_runs, CONFIRMATION_SEED: fresh_run}
         tabm_test_by_seed = {
             seed: np.asarray(run["test_pred"], dtype=float)
@@ -432,19 +379,42 @@ def run_tabm_training(config: TabMTrainingConfig) -> dict[str, Any]:
         pd.DataFrame({ID_COL: test[ID_COL], "fraud_probability_raw": raw_test_pred}).to_csv(
             raw_test_path, index=False
         )
-        primary_name = f"{selected_name}_{calibration['method']}_submission.csv"
+        submission_kind = "submission" if decision["promoted"] else "unpromoted_submission"
+        primary_name = f"{selected_name}_{calibration['method']}_{submission_kind}.csv"
         submission_path = paths["submissions"] / primary_name
         make_submission(test[ID_COL], final_test_pred, submission_path)
-        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_submission.csv"
+        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_{submission_kind}.csv"
         if calibration["method"] != "raw":
             make_submission(test[ID_COL], raw_test_pred, raw_submission_path)
         else:
             raw_submission_path = submission_path
+        decision.update(
+            {
+                "submission_status": "promoted" if decision["promoted"] else "unpromoted",
+                "submission_path": str(submission_path),
+                "raw_submission_path": str(raw_submission_path),
+            }
+        )
+        _save_json(paths["metrics"] / "tabm_promotion_decision.json", decision)
+        _save_final_config(
+            paths,
+            config,
+            source,
+            selected_experiment,
+            selected_name,
+            selected_weight,
+            all_seed_runs,
+            grouped_run,
+            gpu_status,
+            decision,
+            calibration,
+        )
         return {
             "selected_experiment": selected_name,
             "selected_variant": selected_variant,
             "tabm_weight": selected_weight,
-            "promoted": True,
+            "promoted": bool(decision["promoted"]),
+            "submission_status": decision["submission_status"],
             "calibration_method": calibration["method"],
             "submission_path": submission_path,
             "raw_submission_path": raw_submission_path,

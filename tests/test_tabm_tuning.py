@@ -172,6 +172,11 @@ def test_hpo_keeps_trials_model_free_preserves_ctr_and_confirms_selected_seeds(t
     }
     calls = []
     monkeypatch.setattr(tabm_tuning, "train_tabm_cv", _fake_train_tabm_cv(calls))
+    monkeypatch.setattr(
+        tabm_tuning,
+        "reconstruct_ctr_test_predictions",
+        lambda *_: {seed: np.full(len(test), 0.5) for seed in (42, 2026, 2718)},
+    )
 
     result = tabm_tuning.run_tabm_tuning(
         tabm_tuning.TabMTuningConfig(
@@ -192,7 +197,9 @@ def test_hpo_keeps_trials_model_free_preserves_ctr_and_confirms_selected_seeds(t
         if path.is_file()
     }
     assert result["promoted"] is False
-    assert result["submission_path"] is None
+    assert result["submission_status"] == "unpromoted"
+    assert result["submission_path"].exists()
+    assert result["submission_path"].name.endswith("_unpromoted_submission.csv")
     assert source_after == source_before
     assert [call["batch_size"] for call in calls[:2]] == [512, 512]
     assert [call["model_dir"] for call in calls[:2]] == [None, None]
@@ -226,3 +233,7 @@ def test_hpo_selection_requires_screen_guardrails() -> None:
     )
 
     assert tabm_tuning._select_candidate(candidates) is None
+    assert (
+        tabm_tuning._select_candidate(candidates, allow_screen_ineligible=True)["experiment_name"]
+        == "ineligible"
+    )

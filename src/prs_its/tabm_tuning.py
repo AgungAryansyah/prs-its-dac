@@ -219,6 +219,10 @@ def run_tabm_tuning(config: TabMTuningConfig) -> dict[str, Any]:
         candidates = _read_trial_candidates(paths)
         _write_trial_table(paths, candidates)
         selected = _select_candidate(candidates)
+        selection_mode = "screen_eligible"
+        if selected is None:
+            selected = _select_candidate(candidates, allow_screen_ineligible=True)
+            selection_mode = "screen_ineligible_fallback"
         _save_json(
             paths["metrics"] / "tabm_hpo_selection.json",
             {
@@ -227,12 +231,13 @@ def run_tabm_tuning(config: TabMTuningConfig) -> dict[str, Any]:
                 if not candidates.empty
                 else 0,
                 "selected_candidate": None if selected is None else selected,
+                "selection_mode": None if selected is None else selection_mode,
             },
         )
         if selected is None:
             decision = {
                 "promoted": False,
-                "reason": "No TabM HPO candidate cleared the predeclared CTR screen guardrails.",
+                "reason": "No completed TabM HPO candidate is available for final training.",
                 "screen_eligible": False,
             }
             _save_json(paths["metrics"] / "tabm_hpo_promotion_decision.json", decision)
@@ -371,39 +376,21 @@ def run_tabm_tuning(config: TabMTuningConfig) -> dict[str, Any]:
             config.n_bootstrap,
         )
         decision = _promotion_decision(ensemble_comparison, ensemble_fairness, fresh_comparison)
+        confirmation_promoted = bool(decision["promoted"])
+        screen_decision = _screen_decision(pd.Series(selected), control)
         decision.update(
             {
                 "selected_experiment": selected_name,
                 "tabm_weight": selected_weight,
                 "selected_trial": int(selected["trial_number"]),
                 "selected_k": int(selected["k"]),
-                "screen": _screen_decision(pd.Series(selected), control),
+                "screen": screen_decision,
+                "selection_mode": selection_mode,
+                "confirmation_promoted": confirmation_promoted,
+                "promoted": confirmation_promoted and bool(screen_decision["eligible"]),
             }
         )
-        _save_json(paths["metrics"] / "tabm_hpo_promotion_decision.json", decision)
         all_seed_runs = {**selected_seed_runs, CONFIRMATION_SEED: fresh_run}
-        _save_final_config(
-            paths,
-            config,
-            source,
-            params,
-            selected,
-            all_seed_runs,
-            grouped_run,
-            gpu_status,
-            memory_status,
-            decision,
-            calibration,
-        )
-        if not decision["promoted"]:
-            return {
-                "selected_experiment": selected_name,
-                "tabm_weight": selected_weight,
-                "promoted": False,
-                "submission_path": None,
-                "promotion_decision": decision,
-            }
-
         tabm_test = np.mean(
             np.vstack(
                 [np.asarray(all_seed_runs[seed]["test_pred"], dtype=float) for seed in (*ENSEMBLE_SEEDS, CONFIRMATION_SEED)]
@@ -429,17 +416,40 @@ def run_tabm_tuning(config: TabMTuningConfig) -> dict[str, Any]:
         pd.DataFrame(
             {ID_COL: test[ID_COL], "fraud_probability_raw": raw_test_pred}
         ).to_csv(paths["oof"] / f"{selected_name}_test_raw.csv", index=False)
-        submission_path = paths["submissions"] / f"{selected_name}_{calibration['method']}_submission.csv"
+        submission_kind = "submission" if decision["promoted"] else "unpromoted_submission"
+        submission_path = paths["submissions"] / f"{selected_name}_{calibration['method']}_{submission_kind}.csv"
         make_submission(test[ID_COL], final_test_pred, submission_path)
-        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_submission.csv"
+        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_{submission_kind}.csv"
         if calibration["method"] != "raw":
             make_submission(test[ID_COL], raw_test_pred, raw_submission_path)
         else:
             raw_submission_path = submission_path
+        decision.update(
+            {
+                "submission_status": "promoted" if decision["promoted"] else "unpromoted",
+                "submission_path": str(submission_path),
+                "raw_submission_path": str(raw_submission_path),
+            }
+        )
+        _save_json(paths["metrics"] / "tabm_hpo_promotion_decision.json", decision)
+        _save_final_config(
+            paths,
+            config,
+            source,
+            params,
+            selected,
+            all_seed_runs,
+            grouped_run,
+            gpu_status,
+            memory_status,
+            decision,
+            calibration,
+        )
         return {
             "selected_experiment": selected_name,
             "tabm_weight": selected_weight,
-            "promoted": True,
+            "promoted": bool(decision["promoted"]),
+            "submission_status": decision["submission_status"],
             "calibration_method": calibration["method"],
             "submission_path": submission_path,
             "raw_submission_path": raw_submission_path,
@@ -629,13 +639,15 @@ def _rank_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _select_candidate(candidates: pd.DataFrame) -> dict[str, Any] | None:
+def _select_candidate(
+    candidates: pd.DataFrame, *, allow_screen_ineligible: bool = False
+) -> dict[str, Any] | None:
     if candidates.empty:
         return None
-    eligible = candidates.loc[candidates["screen_eligible"]].copy()
-    if eligible.empty:
+    selectable = candidates.copy() if allow_screen_ineligible else candidates.loc[candidates["screen_eligible"]].copy()
+    if selectable.empty:
         return None
-    selected = _rank_candidates(eligible).iloc[0].to_dict()
+    selected = _rank_candidates(selectable).iloc[0].to_dict()
     params = selected.get("params")
     if not isinstance(params, dict):
         raise RuntimeError("Selected TabM HPO candidate has an invalid parameter payload.")

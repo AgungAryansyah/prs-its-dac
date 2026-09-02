@@ -350,23 +350,6 @@ def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
             paths["metrics"] / "history_screen_decision.json",
             {"selected_experiment": selected_name, **screen_decision},
         )
-        if not screen_decision["eligible"]:
-            _save_json(
-                paths["metrics"] / "history_promotion_decision.json",
-                {
-                    "selected_experiment": selected_name,
-                    "promoted": False,
-                    "reason": "The selected history candidate did not clear the screen guardrails.",
-                    **screen_decision,
-                },
-            )
-            return {
-                "selected_experiment": selected_name,
-                "promoted": False,
-                "submission_path": None,
-                "screen_decision": screen_decision,
-            }
-
         selected_seed_runs = {SCREEN_SEED: selected}
         control_seed_runs = {SCREEN_SEED: control}
         for seed in (2026,):
@@ -414,29 +397,15 @@ def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
         _save_grouped_artifacts(paths, grouped_run, y, config.n_bootstrap)
 
         decision = _promotion_decision(ensemble_comparison, ensemble_fairness, fresh_comparison)
-        decision["selected_experiment"] = selected_name
-        decision["screen"] = screen_decision
-        _save_json(paths["metrics"] / "history_promotion_decision.json", decision)
-        _save_final_artifacts(
-            paths,
-            train,
-            test,
-            selected,
-            selected_name,
-            selected_ensemble,
-            bundle,
-            config,
-            gpu_status,
-            decision,
-        )
-        if not decision["promoted"]:
-            return {
+        confirmation_promoted = bool(decision["promoted"])
+        decision.update(
+            {
                 "selected_experiment": selected_name,
-                "promoted": False,
-                "submission_path": None,
-                "promotion_decision": decision,
+                "screen": screen_decision,
+                "confirmation_promoted": confirmation_promoted,
+                "promoted": confirmation_promoted and bool(screen_decision["eligible"]),
             }
-
+        )
         final_test_predictions, final_iterations = _fit_final_models(
             selected,
             y,
@@ -453,21 +422,43 @@ def run_history_training(config: HistoryTrainingConfig) -> dict[str, Any]:
         )
         _save_calibration_artifacts(paths, train, selected_ensemble, calibration)
         primary_test_predictions = calibration["test_pred"]
-        submission_name = f"{selected_name}_{calibration['method']}_submission.csv"
+        submission_kind = "submission" if decision["promoted"] else "unpromoted_submission"
+        submission_name = f"{selected_name}_{calibration['method']}_{submission_kind}.csv"
         submission_path = paths["submissions"] / submission_name
         make_submission(test[ID_COL], primary_test_predictions, submission_path)
-        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_submission.csv"
+        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_{submission_kind}.csv"
         if calibration["method"] != "raw":
             make_submission(test[ID_COL], final_test_predictions, raw_submission_path)
         else:
             raw_submission_path = submission_path
+        decision.update(
+            {
+                "submission_status": "promoted" if decision["promoted"] else "unpromoted",
+                "submission_path": str(submission_path),
+                "raw_submission_path": str(raw_submission_path),
+            }
+        )
+        _save_json(paths["metrics"] / "history_promotion_decision.json", decision)
+        _save_final_artifacts(
+            paths,
+            train,
+            test,
+            selected,
+            selected_name,
+            selected_ensemble,
+            bundle,
+            config,
+            gpu_status,
+            decision,
+        )
         _save_json(
             paths["models"] / "history_final_fit.json",
             {"final_iterations": final_iterations, "ensemble_seeds": [42, 2026, 2718]},
         )
         return {
             "selected_experiment": selected_name,
-            "promoted": True,
+            "promoted": bool(decision["promoted"]),
+            "submission_status": decision["submission_status"],
             "submission_path": submission_path,
             "raw_submission_path": raw_submission_path,
             "calibration_method": calibration["method"],

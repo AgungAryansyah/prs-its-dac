@@ -202,6 +202,11 @@ def test_history_training_runs_all_stages_without_writing_baseline_paths(tmp_pat
         return _fake_train_catboost_cv(*args, **kwargs)
 
     monkeypatch.setattr(history_training, "train_catboost_cv", tracked_train)
+    monkeypatch.setattr(
+        history_training,
+        "_fit_final_models",
+        lambda *_: (np.full(6, 0.5), {"42": 3, "2026": 3, "2718": 3}),
+    )
 
     result = history_training.run_history_training(
         history_training.HistoryTrainingConfig(
@@ -240,11 +245,14 @@ def test_history_training_runs_all_stages_without_writing_baseline_paths(tmp_pat
     assert (run_dir / "metrics" / "history_vs_control_ensemble_paired.csv").exists()
     assert (run_dir / "metrics" / "history_provider_grouped_metrics.csv").exists()
     assert (run_dir / "models" / "history_final_config.json").exists()
-    assert not list((run_dir / "submissions").glob("*.csv"))
+    assert result["submission_status"] == "unpromoted"
+    assert result["submission_path"].exists()
+    assert result["submission_path"].name.endswith("_unpromoted_submission.csv")
     assert not (tmp_path / "outputs" / "models" / "history_final_config.json").exists()
     with (run_dir / "metrics" / "history_promotion_decision.json").open() as file:
         decision = json.load(file)
     assert decision["fraud_capture_meaningful"] is False
+    assert decision["submission_status"] == "unpromoted"
     assert len(train) == 30
 
 

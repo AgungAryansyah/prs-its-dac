@@ -171,14 +171,32 @@ def test_blend_output_paths_require_a_new_isolated_run(tmp_path) -> None:
         blend_training.blend_output_paths(tmp_path, "blend-existing")
 
 
-def test_blend_training_rejects_screen_without_training_xgb(tmp_path, monkeypatch) -> None:
+def test_blend_training_writes_an_unpromoted_submission_after_screen_rejection(tmp_path, monkeypatch) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test-project'\n")
     train, test = _write_competition_data(tmp_path)
-    _write_source_runs(tmp_path, train, test, np.where(train["label"].to_numpy() == 1, 0.1, 0.9))
+    model_features = _write_source_runs(
+        tmp_path, train, test, np.where(train["label"].to_numpy() == 1, 0.1, 0.9)
+    )
+    calls: list[int] = []
     monkeypatch.setattr(
         blend_training,
         "train_xgb_cv",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected XGBoost fit")),
+        _fake_train_xgb_cv(model_features, calls),
+    )
+    monkeypatch.setattr(
+        blend_training,
+        "select_screen_candidate",
+        lambda _: ScreenDecision("ctr_xgb_raw_w02", 0.02, False, False, False, False),
+    )
+    monkeypatch.setattr(
+        blend_training,
+        "promotion_decision",
+        lambda *_: PromotionDecision(False, False, False, False, False, False),
+    )
+    monkeypatch.setattr(
+        blend_training,
+        "reconstruct_ctr_test_predictions",
+        lambda *_: {seed: np.full(len(test), 0.5) for seed in (42, 2026, 2718)},
     )
 
     result = blend_training.run_blend_training(
@@ -193,10 +211,13 @@ def test_blend_training_rejects_screen_without_training_xgb(tmp_path, monkeypatc
 
     run_dir = tmp_path / "outputs" / "runs" / "blend-rejected"
     assert result["status"] == "screen_rejected"
-    assert result["submission_path"] is None
+    assert result["promoted"] is False
+    assert result["submission_status"] == "unpromoted"
+    assert result["submission_path"].exists()
+    assert result["submission_path"].name == "ctr_xgb_raw_w02_unpromoted_submission.csv"
+    assert calls == [2718]
     assert (run_dir / "metrics" / "blend_experiments.csv").exists()
     assert (run_dir / "metrics" / "promotion_decision.json").exists()
-    assert not any((run_dir / "submissions").iterdir())
 
 
 def test_blend_training_confirms_only_fresh_xgb_seed_and_names_submission(tmp_path, monkeypatch) -> None:

@@ -145,6 +145,11 @@ def test_tabm_training_screens_variants_confirms_seeds_and_preserves_ctr(tmp_pat
         if path.is_file()
     )
     monkeypatch.setattr(tabm_training, "train_tabm_cv", _fake_train_tabm_cv(calls))
+    monkeypatch.setattr(
+        tabm_training,
+        "reconstruct_ctr_test_predictions",
+        lambda *_: {seed: np.full(len(test), 0.5) for seed in (42, 2026, 2718)},
+    )
 
     result = tabm_training.run_tabm_training(
         tabm_training.TabMTrainingConfig(
@@ -172,14 +177,15 @@ def test_tabm_training_screens_variants_confirms_seeds_and_preserves_ctr(tmp_pat
     ]
     assert result["selected_variant"] == "tabm_piecewise"
     assert result["promoted"] is False
-    assert result["submission_path"] is None
+    assert result["submission_status"] == "unpromoted"
+    assert result["submission_path"].exists()
+    assert result["submission_path"].name.endswith("_unpromoted_submission.csv")
     assert (run_dir / "metrics" / "tabm_experiments.csv").exists()
     assert (run_dir / "metrics" / "tabm_promotion_decision.json").exists()
     assert (run_dir / "oof" / "tabm_base_oof_seed_42.csv").exists()
     assert (run_dir / "oof" / "tabm_piecewise_oof_seed_2026.csv").exists()
     assert (run_dir / "metrics" / "tabm_piecewise_raw_screen_vs_ctr_paired.csv").exists()
     assert (run_dir / "metrics" / "tabm_piecewise_raw_ensemble_vs_ctr_paired.csv").exists()
-    assert not any((run_dir / "submissions").iterdir())
     assert source_files_after == source_files_before
 
 
