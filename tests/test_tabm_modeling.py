@@ -12,6 +12,7 @@ from prs_its.tabm_modeling import (
     FoldTabMPreprocessor,
     TabMParams,
     _predict_probabilities,
+    ensure_tabm_cuda_memory_ready,
     ensure_tabm_gpu_ready,
     prepare_tabm_features,
     train_tabm_cv,
@@ -172,3 +173,14 @@ def test_cuda_probe_rejects_cpu_only_torch(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="CUDA PyTorch is unavailable"):
         ensure_tabm_gpu_ready()
+
+
+def test_cuda_memory_preflight_rejects_cpu_only_torch(monkeypatch) -> None:
+    monkeypatch.setattr("prs_its.tabm_modeling.torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="CUDA PyTorch is unavailable"):
+        ensure_tabm_cuda_memory_ready(
+            pd.DataFrame({"numeric": [0.0, 1.0]}),
+            [],
+            _small_tabm_params("tabm_piecewise"),
+        )

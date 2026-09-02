@@ -262,6 +262,53 @@ def ensure_tabm_gpu_ready() -> str:
     return f"{torch.cuda.get_device_name(device)}; torch={torch.__version__}; cuda={torch.version.cuda}"
 
 
+def ensure_tabm_cuda_memory_ready(
+    X: pd.DataFrame,
+    categorical_features: list[str],
+    params: TabMParams,
+) -> str:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA PyTorch is unavailable for the TabM memory preflight.")
+    if params.variant != "tabm_piecewise":
+        raise ValueError("TabM CUDA memory preflight requires tabm_piecewise parameters.")
+    if len(X) < 2:
+        raise ValueError("TabM CUDA memory preflight needs at least two rows.")
+    device = torch.device("cuda")
+    model: nn.Module | None = None
+    optimizer: torch.optim.Optimizer | None = None
+    try:
+        preprocessor = FoldTabMPreprocessor(categorical_features, random_state=0).fit(X)
+        x_num, x_cat = preprocessor.transform(X)
+        batch_size = min(params.batch_size, len(X))
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        model = _make_model(x_num, preprocessor.cat_cardinalities, params).to(device)
+        x_num_batch = torch.as_tensor(x_num[:batch_size], dtype=torch.float32, device=device)
+        x_cat_batch = _cat_tensor(x_cat, np.arange(batch_size), device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay
+        )
+        logits = model(x_num_batch, x_cat_batch).squeeze(-1)
+        loss = F.binary_cross_entropy_with_logits(logits, torch.zeros_like(logits))
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize(device)
+        peak_bytes = int(torch.cuda.max_memory_allocated(device))
+    except Exception as error:
+        raise RuntimeError(
+            "TabM CUDA memory preflight failed for the largest allowed configuration "
+            f"(k={params.k}, d_block={params.d_block}, n_blocks={params.n_blocks}, "
+            f"batch_size={params.batch_size}): {error}"
+        ) from error
+    finally:
+        del optimizer
+        if model is not None:
+            model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return f"TabM CUDA memory preflight passed; peak_allocated_bytes={peak_bytes}"
+
+
 def train_tabm_cv(
     X: pd.DataFrame,
     y: pd.Series,
