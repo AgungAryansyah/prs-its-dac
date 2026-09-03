@@ -284,11 +284,17 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
         )
         submission_path = paths["submissions"] / f"{selected_name}_{calibration['method']}_unpromoted_submission.csv"
         make_submission(test[ID_COL], final_test, submission_path)
+        raw_submission_path = paths["submissions"] / f"{selected_name}_raw_unpromoted_submission.csv"
+        if calibration["method"] == "raw":
+            raw_submission_path = submission_path
+        else:
+            make_submission(test[ID_COL], raw_test, raw_submission_path)
         decision = {
             **screen_decision,
             "selected_experiment": selected_name,
             "submission_status": "unpromoted",
             "submission_path": str(submission_path),
+            "raw_submission_path": str(raw_submission_path),
             "promoted": False,
             "confirmation_status": "not_run",
             "runtime_seconds": time.monotonic() - started,
@@ -304,6 +310,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
             "promoted": False,
             "submission_status": "unpromoted",
             "submission_path": submission_path,
+            "raw_submission_path": raw_submission_path,
             "promotion_decision": decision,
         }
     finally:
