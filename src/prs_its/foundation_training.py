@@ -152,7 +152,6 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
         prediction_chunk_size=config.prediction_chunk_size,
         min_free_vram_gib=config.min_free_vram_gib,
     )
-    paths = foundation_output_paths(config.project_root, config.run_name)
     preflight = run_foundation_preflight(
         foundation_prepared.X,
         foundation_prepared.y,
@@ -161,8 +160,8 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
         foundation_params,
         seed=FOUNDATION_SCREEN_SEED,
         task_type=task_type,
-        cache_dir=paths["cache"],
     )
+    paths = foundation_output_paths(config.project_root, config.run_name)
     _save_json(paths["metrics"] / "foundation_preflight.json", preflight)
     if config.max_runtime_minutes * 60 <= time.monotonic() - started:
         raise RuntimeError("Foundation runtime budget was exhausted during preflight.")
@@ -319,7 +318,6 @@ def preflight_foundation_training(config: FoundationTrainingConfig) -> dict[str,
     spec = make_feature_spec(train, test)
     _load_source_recipes(config, train, test, spec)
     prepared = prepare_foundation_features(train, test, spec)
-    paths = foundation_output_paths(config.project_root, config.run_name)
     result = run_foundation_preflight(
         prepared.X,
         prepared.y,
@@ -333,8 +331,8 @@ def preflight_foundation_training(config: FoundationTrainingConfig) -> dict[str,
         ),
         seed=FOUNDATION_SCREEN_SEED,
         task_type=config.task_type,
-        cache_dir=paths["cache"],
     )
+    paths = foundation_output_paths(config.project_root, config.run_name)
     result.update(
         {
             "source_runs_validated": {
