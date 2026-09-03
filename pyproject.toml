@@ -42,6 +42,7 @@ prs-its-blend-train = "prs_its.blend_training:main"
 prs-its-history-train = "prs_its.history_training:main"
 prs-its-tabm-train = "prs_its.tabm_training:main"
 prs-its-tabm-tune = "prs_its.tabm_tuning:main"
+prs-its-foundation-train = "prs_its.foundation_training:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
