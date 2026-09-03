@@ -210,3 +210,104 @@ def test_runner_writes_unpromoted_submission_without_model_artifacts(tmp_path: P
     assert list((run_dir / "models").glob("*")) == [] if (run_dir / "models").exists() else True
     assert (run_dir / "metrics" / "foundation_promotion_decision.json").exists()
     assert (run_dir / "metrics" / "foundation_final_config.json").exists()
+
+
+def test_resume_finalizes_saved_seed_artifacts_without_retraining(tmp_path: Path, monkeypatch) -> None:
+    train, test = _data(tmp_path)
+    _sources(tmp_path, train, test)
+    config = foundation_training.FoundationTrainingConfig(
+        project_root=tmp_path,
+        run_name="foundation-resume",
+        task_type="CPU",
+        n_bootstrap=2,
+        show_progress=False,
+        resume=True,
+    )
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    paths = foundation_training.foundation_output_paths(tmp_path, config.run_name)
+    foundation_prepared = foundation_training.prepare_foundation_features(
+        train, test, make_feature_spec(train, test)
+    )
+    foundation_params = foundation_training._foundation_params(config, foundation_prepared)
+    (paths["metrics"] / "foundation_preflight.json").write_text(
+        json.dumps({"model": "tabicl-v2", "params": foundation_params.as_dict()})
+    )
+    ctr_prepared = foundation_training.prepare_catboost_features(
+        train,
+        test,
+        make_feature_spec(train, test),
+        add_count_features=True,
+        add_interaction_features=True,
+        add_los_features=True,
+        add_count_bucket_features=True,
+        additional_interaction_features={"dati2_typeppk": ("dati2", "typeppk")},
+    )
+    tabm_prepared = foundation_training.prepare_tabm_features(
+        train, test, make_feature_spec(train, test)
+    )
+    for seed in (42, 2026):
+        foundation_training._save_seed_artifact(
+            paths, train, test, "ctr", seed, _result(ctr_prepared.X, ctr_prepared.y, ctr_prepared.X_test, cv, 0.75)
+        )
+        foundation_training._save_seed_artifact(
+            paths, train, test, "tabm", seed, _result(tabm_prepared.X, tabm_prepared.y, tabm_prepared.X_test, cv, 0.8)
+        )
+    foundation_training._save_seed_artifact(
+        paths,
+        train,
+        test,
+        "foundation",
+        42,
+        _result(
+            foundation_prepared.X,
+            foundation_prepared.y,
+            foundation_prepared.X_test,
+            cv,
+            0.85,
+        ),
+    )
+
+    monkeypatch.setattr(
+        foundation_training,
+        "_train_ctr_seed",
+        lambda *args, **kwargs: pytest.fail("CTR training must not run during resume"),
+    )
+    monkeypatch.setattr(
+        foundation_training,
+        "_train_tabm_seed",
+        lambda *args, **kwargs: pytest.fail("TabM training must not run during resume"),
+    )
+    monkeypatch.setattr(
+        foundation_training,
+        "train_foundation_cv",
+        lambda *args, **kwargs: pytest.fail("Foundation training must not run during resume"),
+    )
+
+    result = foundation_training.run_foundation_training(config)
+
+    assert result["resumed"] is True
+    assert result["submission_path"].exists()
+    decision = json.loads((paths["metrics"] / "foundation_promotion_decision.json").read_text())
+    assert decision["resumed"] is True
+
+
+def test_resume_rejects_incomplete_saved_seed_artifacts(tmp_path: Path) -> None:
+    train, test = _data(tmp_path)
+    paths = foundation_training.foundation_output_paths(tmp_path, "foundation-incomplete")
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    prepared = foundation_training.prepare_foundation_features(train, test, make_feature_spec(train, test))
+    result = _result(prepared.X, prepared.y, prepared.X_test, cv, 0.85)
+    foundation_training._save_seed_artifact(paths, train, test, "foundation", 42, result)
+    (paths["metrics"] / "foundation_fold_metrics_seed_42.csv").unlink()
+
+    with pytest.raises(FileNotFoundError, match="saved artifacts are incomplete"):
+        foundation_training._load_saved_seed_result(
+            paths,
+            train,
+            test,
+            "foundation",
+            42,
+            foundation_training._expected_fold_ids(cv, train),
+            prepared,
+            foundation_training.FoundationParams().as_dict(),
+        )

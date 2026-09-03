@@ -81,6 +81,7 @@ class FoundationTrainingConfig:
     min_free_vram_gib: float = DEFAULT_MIN_FREE_VRAM_GIB
     tabicl_cache_mode: str = "auto"
     accept_tabpfn_terms: bool = False
+    resume: bool = False
 
     def __post_init__(self) -> None:
         if not self.run_name:
@@ -119,13 +120,20 @@ class SourceRecipes:
     tabm_selection: dict[str, Any]
 
 
-def foundation_output_paths(project_root: Path, run_name: str) -> dict[str, Path]:
+def foundation_output_paths(
+    project_root: Path,
+    run_name: str,
+    *,
+    resume: bool = False,
+) -> dict[str, Path]:
     if not run_name:
         raise ValueError("run_name is required.")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_name):
         raise ValueError("run_name may contain only letters, numbers, underscores, and hyphens.")
     root = project_root / "outputs" / "runs" / run_name
-    if root.exists() and any(root.iterdir()):
+    if resume and not root.exists():
+        raise FileNotFoundError(f"Foundation run does not exist and cannot be resumed: {root}")
+    if not resume and root.exists() and any(root.iterdir()):
         raise FileExistsError(f"Foundation output run already contains artifacts: {root}")
     paths = {
         "root": root,
@@ -137,6 +145,120 @@ def foundation_output_paths(project_root: Path, run_name: str) -> dict[str, Path
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
+
+
+def _load_resume_preflight(
+    paths: dict[str, Path],
+    config: FoundationTrainingConfig,
+    expected_params: FoundationParams,
+) -> tuple[dict[str, Any], FoundationParams]:
+    preflight = _load_json(paths["metrics"] / "foundation_preflight.json")
+    payload = preflight.get("params")
+    if not isinstance(payload, dict):
+        raise ValueError("Saved foundation preflight does not contain model parameters.")
+    try:
+        params = FoundationParams(
+            **{
+                **payload,
+                "categorical_feature_indices": tuple(payload.get("categorical_feature_indices", ())),
+            }
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Saved foundation preflight has invalid model parameters.") from error
+    if params.model != config.model:
+        raise ValueError("Saved foundation preflight model does not match --model.")
+    if tuple(params.categorical_feature_indices) != tuple(expected_params.categorical_feature_indices):
+        raise ValueError("Current data no longer matches the saved foundation categorical schema.")
+    return preflight, params
+
+
+def _expected_fold_ids(
+    cv: StratifiedKFold,
+    train: pd.DataFrame,
+) -> np.ndarray:
+    fold_id = np.full(len(train), -1, dtype=int)
+    labels = train[TARGET].astype(int)
+    for fold, (_, valid_idx) in enumerate(cv.split(train, labels)):
+        fold_id[valid_idx] = fold
+    if (fold_id < 0).any():
+        raise RuntimeError("Current cross-validation split does not cover every training row.")
+    return fold_id
+
+
+def _load_saved_seed_result(
+    paths: dict[str, Path],
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    name: str,
+    seed: int,
+    expected_fold_id: np.ndarray,
+    prepared: PreparedFeatures,
+    params: dict[str, Any],
+) -> dict[str, Any] | None:
+    oof_path = paths["oof"] / f"{name}_oof_seed_{seed}.csv"
+    test_path = paths["oof"] / f"{name}_test_fold_predictions_seed_{seed}.csv"
+    metrics_path = paths["metrics"] / f"{name}_fold_metrics_seed_{seed}.csv"
+    artifacts = (oof_path, test_path, metrics_path)
+    if not any(path.exists() for path in artifacts):
+        return None
+    missing = [str(path) for path in artifacts if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot resume {name} seed {seed}; saved artifacts are incomplete: {missing}"
+        )
+
+    oof = pd.read_csv(oof_path)
+    required_oof = {ID_COL, TARGET, "fold", "fraud_probability_raw", "random_seed"}
+    missing_oof = sorted(required_oof - set(oof))
+    if missing_oof:
+        raise ValueError(f"Saved {name} seed {seed} OOF is missing columns: {missing_oof}")
+    if not np.array_equal(oof[ID_COL].to_numpy(), train[ID_COL].to_numpy()):
+        raise ValueError(f"Saved {name} seed {seed} OOF claim IDs do not match current training data.")
+    if not np.array_equal(oof[TARGET].to_numpy(dtype=int), train[TARGET].to_numpy(dtype=int)):
+        raise ValueError(f"Saved {name} seed {seed} OOF labels do not match current training data.")
+    fold_id = oof["fold"].to_numpy(dtype=int)
+    if not np.array_equal(fold_id, expected_fold_id):
+        raise ValueError(f"Saved {name} seed {seed} OOF folds do not match the current CV split.")
+    if not np.all(oof["random_seed"].to_numpy(dtype=int) == seed):
+        raise ValueError(f"Saved {name} OOF random_seed does not match {seed}.")
+    oof_pred = _validated_probabilities(
+        oof["fraud_probability_raw"].to_numpy(dtype=float), f"Saved {name} seed {seed} OOF"
+    )
+
+    test_predictions = pd.read_csv(test_path)
+    if ID_COL not in test_predictions:
+        raise ValueError(f"Saved {name} seed {seed} test predictions are missing {ID_COL}.")
+    if not np.array_equal(test_predictions[ID_COL].to_numpy(), test[ID_COL].to_numpy()):
+        raise ValueError(f"Saved {name} seed {seed} test claim IDs do not match current test data.")
+    fold_count = len(np.unique(expected_fold_id))
+    expected_columns = [f"fold_{fold}" for fold in range(fold_count)]
+    if list(test_predictions.columns) != [ID_COL, *expected_columns]:
+        raise ValueError(f"Saved {name} seed {seed} test prediction folds are invalid.")
+    test_fold_predictions = test_predictions[expected_columns].to_numpy(dtype=float).T
+    _validated_probabilities(
+        test_fold_predictions.reshape(-1), f"Saved {name} seed {seed} test predictions"
+    )
+
+    fold_metrics = pd.read_csv(metrics_path)
+    if "fold" not in fold_metrics or "random_seed" not in fold_metrics:
+        raise ValueError(f"Saved {name} seed {seed} fold metrics are missing fold metadata.")
+    if not np.array_equal(
+        np.sort(fold_metrics["fold"].to_numpy(dtype=int)), np.arange(fold_count, dtype=int)
+    ):
+        raise ValueError(f"Saved {name} seed {seed} fold metrics are incomplete.")
+    if not np.all(fold_metrics["random_seed"].to_numpy(dtype=int) == seed):
+        raise ValueError(f"Saved {name} seed {seed} fold metrics have the wrong random_seed.")
+
+    return {
+        "oof_pred": oof_pred,
+        "test_pred": np.mean(test_fold_predictions, axis=0),
+        "test_fold_predictions": test_fold_predictions,
+        "fold_id": fold_id,
+        "fold_metrics": fold_metrics.drop(columns="random_seed"),
+        "prepared": prepared,
+        "params": params,
+        "seed": seed,
+    }
 
 
 def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
@@ -151,22 +273,26 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
     foundation_prepared = prepare_foundation_features(train, test, spec)
     cv = _make_cv(config)
     foundation_params = _foundation_params(config, foundation_prepared)
-    preflight = run_foundation_preflight(
-        foundation_prepared.X,
-        foundation_prepared.y,
-        foundation_prepared.categorical_features,
-        cv,
-        foundation_params,
-        seed=FOUNDATION_SCREEN_SEED,
-        task_type=task_type,
-    )
-    paths = foundation_output_paths(config.project_root, config.run_name)
-    _save_json(paths["metrics"] / "foundation_preflight.json", preflight)
-    effective_cache_mode = preflight.get("params", {}).get("tabicl_cache_mode")
-    if isinstance(effective_cache_mode, str) and effective_cache_mode != foundation_params.tabicl_cache_mode:
-        foundation_params = replace(foundation_params, tabicl_cache_mode=effective_cache_mode)
-    if config.max_runtime_minutes * 60 <= time.monotonic() - started:
-        raise RuntimeError("Foundation runtime budget was exhausted during preflight.")
+    if config.resume:
+        paths = foundation_output_paths(config.project_root, config.run_name, resume=True)
+        preflight, foundation_params = _load_resume_preflight(paths, config, foundation_params)
+    else:
+        preflight = run_foundation_preflight(
+            foundation_prepared.X,
+            foundation_prepared.y,
+            foundation_prepared.categorical_features,
+            cv,
+            foundation_params,
+            seed=FOUNDATION_SCREEN_SEED,
+            task_type=task_type,
+        )
+        paths = foundation_output_paths(config.project_root, config.run_name)
+        _save_json(paths["metrics"] / "foundation_preflight.json", preflight)
+        effective_cache_mode = preflight.get("params", {}).get("tabicl_cache_mode")
+        if isinstance(effective_cache_mode, str) and effective_cache_mode != foundation_params.tabicl_cache_mode:
+            foundation_params = replace(foundation_params, tabicl_cache_mode=effective_cache_mode)
+        if config.max_runtime_minutes * 60 <= time.monotonic() - started:
+            raise RuntimeError("Foundation runtime budget was exhausted during preflight.")
 
     if config.show_progress:
         progress = tqdm(total=5, desc="Foundation challenger", unit="stage")
@@ -176,54 +302,101 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
     try:
         ctr_runs: dict[int, dict[str, Any]] = {}
         tabm_runs: dict[int, dict[str, Any]] = {}
+        expected_fold_id = _expected_fold_ids(cv, train)
         for seed in FOUNDATION_CONFIRMATION_SEEDS:
-            _check_budget(started, config.max_runtime_minutes, f"before CTR seed {seed}")
-            ctr_runs[seed] = _train_ctr_seed(
-                train,
-                test,
-                sources.ctr_prepared,
-                sources.ctr_config,
-                cv,
-                seed,
-                task_type,
-                config.devices,
+            ctr_runs[seed] = (
+                _load_saved_seed_result(
+                    paths,
+                    train,
+                    test,
+                    "ctr",
+                    seed,
+                    expected_fold_id,
+                    sources.ctr_prepared,
+                    sources.ctr_config["params"],
+                )
+                if config.resume
+                else None
             )
-            _save_seed_artifact(paths, train, test, "ctr", seed, ctr_runs[seed])
-            _release_result(ctr_runs[seed])
+            if ctr_runs[seed] is None:
+                _check_budget(started, config.max_runtime_minutes, f"before CTR seed {seed}")
+                ctr_runs[seed] = _train_ctr_seed(
+                    train,
+                    test,
+                    sources.ctr_prepared,
+                    sources.ctr_config,
+                    cv,
+                    seed,
+                    task_type,
+                    config.devices,
+                )
+                _save_seed_artifact(paths, train, test, "ctr", seed, ctr_runs[seed])
+                _release_result(ctr_runs[seed])
             if progress is not None:
                 progress.update(1)
 
-            _check_budget(started, config.max_runtime_minutes, f"before TabM seed {seed}")
-            tabm_runs[seed] = _train_tabm_seed(
-                train,
-                test,
-                sources,
-                cv,
-                seed,
-                task_type,
+            tabm_prepared = prepare_tabm_features(train, test, spec) if config.resume else None
+            tabm_runs[seed] = (
+                _load_saved_seed_result(
+                    paths,
+                    train,
+                    test,
+                    "tabm",
+                    seed,
+                    expected_fold_id,
+                    tabm_prepared,
+                    sources.tabm_params.as_dict(),
+                )
+                if config.resume
+                else None
             )
-            _save_seed_artifact(paths, train, test, "tabm", seed, tabm_runs[seed])
-            _release_result(tabm_runs[seed])
+            if tabm_runs[seed] is None:
+                _check_budget(started, config.max_runtime_minutes, f"before TabM seed {seed}")
+                tabm_runs[seed] = _train_tabm_seed(
+                    train,
+                    test,
+                    sources,
+                    cv,
+                    seed,
+                    task_type,
+                )
+                _save_seed_artifact(paths, train, test, "tabm", seed, tabm_runs[seed])
+                _release_result(tabm_runs[seed])
             if progress is not None:
                 progress.update(1)
 
-        _check_budget(started, config.max_runtime_minutes, "before foundation model")
-        foundation_result = train_foundation_cv(
-            foundation_prepared.X,
-            foundation_prepared.y,
-            foundation_prepared.X_test,
-            foundation_prepared.categorical_features,
-            cv,
-            foundation_params,
-            seed=FOUNDATION_SCREEN_SEED,
-            task_type=task_type,
-            cache_dir=paths["cache"],
-            progress_callback=_foundation_progress(progress),
-            predict_test=True,
+        foundation_result = (
+            _load_saved_seed_result(
+                paths,
+                train,
+                test,
+                "foundation",
+                FOUNDATION_SCREEN_SEED,
+                expected_fold_id,
+                foundation_prepared,
+                foundation_params.as_dict(),
+            )
+            if config.resume
+            else None
         )
-        _save_seed_artifact(paths, train, test, "foundation", FOUNDATION_SCREEN_SEED, foundation_result)
-        _release_result(foundation_result)
-        _check_budget(started, config.max_runtime_minutes, "after foundation model")
+        if foundation_result is None:
+            _check_budget(started, config.max_runtime_minutes, "before foundation model")
+            foundation_result = train_foundation_cv(
+                foundation_prepared.X,
+                foundation_prepared.y,
+                foundation_prepared.X_test,
+                foundation_prepared.categorical_features,
+                cv,
+                foundation_params,
+                seed=FOUNDATION_SCREEN_SEED,
+                task_type=task_type,
+                cache_dir=paths["cache"],
+                progress_callback=_foundation_progress(progress),
+                predict_test=True,
+            )
+            _save_seed_artifact(paths, train, test, "foundation", FOUNDATION_SCREEN_SEED, foundation_result)
+            _release_result(foundation_result)
+            _check_budget(started, config.max_runtime_minutes, "after foundation model")
         if progress is not None:
             progress.update(1)
 
@@ -303,6 +476,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
             "confirmation_status": "not_run",
             "fallback_policy": "run tabpfn-3 only in a separate run after TabICLv2 preflight failure or rejection",
             "runtime_seconds": time.monotonic() - started,
+            "resumed": config.resume,
             "model_artifacts": "not_saved_locally; retain on remote training server",
         }
         _save_json(paths["metrics"] / "foundation_promotion_decision.json", decision)
@@ -317,6 +491,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
             "submission_path": submission_path,
             "raw_submission_path": raw_submission_path,
             "promotion_decision": decision,
+            "resumed": config.resume,
         }
     finally:
         if progress is not None:
@@ -932,6 +1107,7 @@ def _run_manifest(
         "model": config.model,
         "task_type": config.task_type.upper(),
         "devices": config.devices,
+        "resumed": config.resume,
         "runtime_budget_minutes": config.max_runtime_minutes,
         "runtime_seconds": time.monotonic() - started,
         "foundation_params": foundation_params.as_dict(),
@@ -1006,6 +1182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tabicl-cache-mode", choices=TABICL_CACHE_MODES, default="auto")
     parser.add_argument("--confirm-tabpfn-eligibility", action="store_true")
     parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -1031,8 +1208,11 @@ def main() -> None:
         min_free_vram_gib=args.min_free_vram_gib,
         tabicl_cache_mode=args.tabicl_cache_mode,
         accept_tabpfn_terms=args.confirm_tabpfn_eligibility,
+        resume=args.resume,
     )
     if args.preflight:
+        if args.resume:
+            raise ValueError("--resume cannot be used with --preflight.")
         result = preflight_foundation_training(config)
     else:
         result = run_foundation_training(config)
