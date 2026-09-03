@@ -138,6 +138,22 @@ def test_tabpfn_requires_explicit_terms_confirmation(tmp_path: Path) -> None:
         )
 
 
+def test_preflight_failure_does_not_create_run_directory(tmp_path: Path, monkeypatch) -> None:
+    train, test = _data(tmp_path)
+    _sources(tmp_path, train, test)
+    monkeypatch.setattr(
+        foundation_training,
+        "run_foundation_preflight",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no GPU")),
+    )
+    config = foundation_training.FoundationTrainingConfig(
+        project_root=tmp_path, run_name="foundation-preflight-failure", task_type="CPU"
+    )
+    with pytest.raises(RuntimeError, match="no GPU"):
+        foundation_training.preflight_foundation_training(config)
+    assert not (tmp_path / "outputs" / "runs" / config.run_name).exists()
+
+
 def test_runner_writes_unpromoted_submission_without_model_artifacts(tmp_path: Path, monkeypatch) -> None:
     train, test = _data(tmp_path)
     _sources(tmp_path, train, test)
@@ -193,4 +209,3 @@ def test_runner_writes_unpromoted_submission_without_model_artifacts(tmp_path: P
     assert list((run_dir / "models").glob("*")) == [] if (run_dir / "models").exists() else True
     assert (run_dir / "metrics" / "foundation_promotion_decision.json").exists()
     assert (run_dir / "metrics" / "foundation_final_config.json").exists()
-
