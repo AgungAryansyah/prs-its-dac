@@ -221,6 +221,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
         )
         _save_seed_artifact(paths, train, test, "foundation", FOUNDATION_SCREEN_SEED, foundation_result)
         _release_result(foundation_result)
+        _check_budget(started, config.max_runtime_minutes, "after foundation model")
         if progress is not None:
             progress.update(1)
 
