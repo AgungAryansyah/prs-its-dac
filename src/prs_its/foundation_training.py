@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib.metadata
 import json
 from pathlib import Path
@@ -29,6 +29,7 @@ from prs_its.foundation_modeling import (
     DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE,
     DEFAULT_MIN_FREE_VRAM_GIB,
     FOUNDATION_MODELS,
+    TABICL_CACHE_MODES,
     FoundationParams,
     prepare_foundation_features,
     run_foundation_preflight,
@@ -78,6 +79,7 @@ class FoundationTrainingConfig:
     n_estimators: int = DEFAULT_FOUNDATION_ESTIMATORS
     prediction_chunk_size: int = DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE
     min_free_vram_gib: float = DEFAULT_MIN_FREE_VRAM_GIB
+    tabicl_cache_mode: str = "auto"
     accept_tabpfn_terms: bool = False
 
     def __post_init__(self) -> None:
@@ -105,6 +107,8 @@ class FoundationTrainingConfig:
             raise ValueError("Foundation estimator and prediction chunk sizes must be positive.")
         if self.min_free_vram_gib <= 0:
             raise ValueError("min_free_vram_gib must be positive.")
+        if self.tabicl_cache_mode not in TABICL_CACHE_MODES:
+            raise ValueError(f"tabicl_cache_mode must be one of {TABICL_CACHE_MODES}.")
 
 
 @dataclass(frozen=True)
@@ -158,6 +162,9 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
     )
     paths = foundation_output_paths(config.project_root, config.run_name)
     _save_json(paths["metrics"] / "foundation_preflight.json", preflight)
+    effective_cache_mode = preflight.get("params", {}).get("tabicl_cache_mode")
+    if isinstance(effective_cache_mode, str) and effective_cache_mode != foundation_params.tabicl_cache_mode:
+        foundation_params = replace(foundation_params, tabicl_cache_mode=effective_cache_mode)
     if config.max_runtime_minutes * 60 <= time.monotonic() - started:
         raise RuntimeError("Foundation runtime budget was exhausted during preflight.")
 
@@ -358,6 +365,7 @@ def _foundation_params(
         prediction_chunk_size=config.prediction_chunk_size,
         min_free_vram_gib=config.min_free_vram_gib,
         categorical_feature_indices=indices,
+        tabicl_cache_mode=config.tabicl_cache_mode,
     )
 
 
@@ -995,6 +1003,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-estimators", type=int, default=DEFAULT_FOUNDATION_ESTIMATORS)
     parser.add_argument("--prediction-chunk-size", type=int, default=DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE)
     parser.add_argument("--min-free-vram-gib", type=float, default=DEFAULT_MIN_FREE_VRAM_GIB)
+    parser.add_argument("--tabicl-cache-mode", choices=TABICL_CACHE_MODES, default="auto")
     parser.add_argument("--confirm-tabpfn-eligibility", action="store_true")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -1020,6 +1029,7 @@ def main() -> None:
         n_estimators=args.n_estimators,
         prediction_chunk_size=args.prediction_chunk_size,
         min_free_vram_gib=args.min_free_vram_gib,
+        tabicl_cache_mode=args.tabicl_cache_mode,
         accept_tabpfn_terms=args.confirm_tabpfn_eligibility,
     )
     if args.preflight:
