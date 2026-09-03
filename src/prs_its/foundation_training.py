@@ -267,9 +267,10 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
             started,
             screen_decision,
         )
-        final_test = _selected_test_predictions(
+        raw_test = _selected_test_predictions(
             ctr["test_pred"], tabm["test_pred"], foundation_result["test_pred"], float(selected_row["foundation_weight"])
         )
+        final_test = raw_test.copy()
         if calibration["method"] != "raw":
             final_test = calibrate_test_predictions(
                 selected_frame["fraud_probability_raw"],
@@ -278,7 +279,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
                 calibration["method"],
             )
         raw_test_path = paths["oof"] / f"{selected_name}_test_raw.csv"
-        pd.DataFrame({ID_COL: test[ID_COL], "fraud_probability_raw": final_test}).to_csv(
+        pd.DataFrame({ID_COL: test[ID_COL], "fraud_probability_raw": raw_test}).to_csv(
             raw_test_path, index=False
         )
         submission_path = paths["submissions"] / f"{selected_name}_{calibration['method']}_unpromoted_submission.csv"
