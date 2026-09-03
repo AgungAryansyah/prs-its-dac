@@ -185,3 +185,43 @@ def test_predict_probabilities_rejects_non_binary_output() -> None:
 
     with pytest.raises(RuntimeError, match="binary probabilities"):
         _predict_probabilities(Estimator(), pd.DataFrame({"x": [1, 2]}), 1)
+
+
+def test_foundation_cv_retries_tabicl_with_representation_cache_on_oom(monkeypatch) -> None:
+    train, test = _datasets(rows=20)
+    prepared = prepare_foundation_features(train, test, make_feature_spec(train, test))
+    monkeypatch.setattr(foundation_modeling, "ensure_foundation_gpu_ready", lambda *_: "gpu")
+    calls: list[str] = []
+
+    class Estimator:
+        def __init__(self, cache_mode: str):
+            self.cache_mode = cache_mode
+
+        def fit(self, X, y):
+            calls.append(self.cache_mode)
+            if self.cache_mode == "auto":
+                raise RuntimeError("CUDA out of memory")
+            self.rate = float(np.mean(y))
+
+        def predict_proba(self, X):
+            values = np.full(len(X), self.rate)
+            return np.column_stack([1 - values, values])
+
+    def factory(params, seed, cache_dir, task_type):
+        return Estimator(params.tabicl_cache_mode)
+
+    result = train_foundation_cv(
+        prepared.X,
+        prepared.y,
+        prepared.X_test,
+        prepared.categorical_features,
+        cv=StratifiedKFold(n_splits=2, shuffle=True, random_state=42),
+        params=FoundationParams(tabicl_cache_mode="auto"),
+        seed=42,
+        task_type="GPU",
+        estimator_factory=factory,
+    )
+
+    assert calls == ["auto", "repr", "auto", "repr"]
+    assert result["effective_tabicl_cache_mode"] == "repr"
+    assert set(result["fold_metrics"]["tabicl_cache_mode"]) == {"repr"}
