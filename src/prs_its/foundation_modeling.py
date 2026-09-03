@@ -27,6 +27,7 @@ class FoundationParams:
     estimator_batch_size: int = 1
     prediction_chunk_size: int = DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE
     min_free_vram_gib: float = DEFAULT_MIN_FREE_VRAM_GIB
+    categorical_feature_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.model not in FOUNDATION_MODELS:
@@ -37,6 +38,8 @@ class FoundationParams:
             raise ValueError("prediction_chunk_size must be positive.")
         if self.min_free_vram_gib <= 0:
             raise ValueError("min_free_vram_gib must be positive.")
+        if any(index < 0 for index in self.categorical_feature_indices):
+            raise ValueError("categorical_feature_indices must be non-negative.")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -266,6 +269,7 @@ def _create_estimator(
         ModelVersion.V3,
         n_estimators=params.n_estimators,
         auto_scale_n_estimators=False,
+        categorical_features_indices=list(params.categorical_feature_indices) or None,
         device=device,
         fit_mode="low_memory",
         memory_saving_mode=True,
