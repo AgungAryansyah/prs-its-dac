@@ -21,6 +21,12 @@ dependencies = [
     "torch>=2.13.0",
     "tabm>=0.0.3",
     "rtdl-num-embeddings>=0.0.12",
+    "tabicl==2.2.0",
+]
+
+[project.optional-dependencies]
+tabpfn = [
+    "tabpfn==8.5.0",
 ]
 
 [dependency-groups]
