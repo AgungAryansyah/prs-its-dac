@@ -8,7 +8,6 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
 import torch
 
 from prs_its.metrics import evaluate_probabilities
