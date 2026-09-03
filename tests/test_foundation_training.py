@@ -206,6 +206,7 @@ def test_runner_writes_unpromoted_submission_without_model_artifacts(tmp_path: P
     assert result["promoted"] is False
     assert result["submission_status"] == "unpromoted"
     assert result["submission_path"].exists()
+    assert result["raw_submission_path"].exists()
     assert list((run_dir / "models").glob("*")) == [] if (run_dir / "models").exists() else True
     assert (run_dir / "metrics" / "foundation_promotion_decision.json").exists()
     assert (run_dir / "metrics" / "foundation_final_config.json").exists()
