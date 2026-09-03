@@ -114,6 +114,8 @@ def train_foundation_cv(
             progress_callback("start", fold)
         started = time.monotonic()
         fold_cache = cache_dir / f"seed_{seed}/fold_{fold}" if cache_dir is not None else None
+        if fold_cache is not None:
+            fold_cache.mkdir(parents=True, exist_ok=True)
         estimator = factory(params, seed + fold, fold_cache, task_type)
         try:
             X_train = X.iloc[train_idx]
