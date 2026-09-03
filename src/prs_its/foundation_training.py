@@ -389,6 +389,10 @@ def _load_source_recipes(
     params = TabMParams(**selected["params"])
     if params.variant != "tabm_piecewise":
         raise ValueError("Foundation challenger requires the selected tabm_piecewise recipe.")
+    if selected.get("tabm_variant", params.variant) != params.variant:
+        raise ValueError("TabM selection metadata does not match its parameter variant.")
+    if selected.get("candidate_type", "fixed_blend") != "fixed_blend":
+        raise ValueError("Foundation challenger requires the fixed TabM blend candidate.")
     if float(selected.get("tabm_weight", 0.5)) != 0.5:
         raise ValueError("Foundation challenger requires the selected 50% TabM blend recipe.")
     return SourceRecipes(ctr_config, ctr_prepared, params, selection)
