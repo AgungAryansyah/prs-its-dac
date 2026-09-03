@@ -146,12 +146,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
     sources = _load_source_recipes(config, train, test, spec)
     foundation_prepared = prepare_foundation_features(train, test, spec)
     cv = _make_cv(config)
-    foundation_params = FoundationParams(
-        model=config.model,
-        n_estimators=config.n_estimators,
-        prediction_chunk_size=config.prediction_chunk_size,
-        min_free_vram_gib=config.min_free_vram_gib,
-    )
+    foundation_params = _foundation_params(config, foundation_prepared)
     preflight = run_foundation_preflight(
         foundation_prepared.X,
         foundation_prepared.y,
@@ -332,12 +327,7 @@ def preflight_foundation_training(config: FoundationTrainingConfig) -> dict[str,
         prepared.y,
         prepared.categorical_features,
         _make_cv(config),
-        FoundationParams(
-            model=config.model,
-            n_estimators=config.n_estimators,
-            prediction_chunk_size=config.prediction_chunk_size,
-            min_free_vram_gib=config.min_free_vram_gib,
-        ),
+        _foundation_params(config, prepared),
         seed=FOUNDATION_SCREEN_SEED,
         task_type=config.task_type,
     )
@@ -353,6 +343,20 @@ def preflight_foundation_training(config: FoundationTrainingConfig) -> dict[str,
     )
     _save_json(paths["metrics"] / "foundation_preflight.json", result)
     return result
+
+
+def _foundation_params(
+    config: FoundationTrainingConfig,
+    prepared: PreparedFeatures,
+) -> FoundationParams:
+    indices = tuple(prepared.X.columns.get_loc(feature) for feature in prepared.categorical_features)
+    return FoundationParams(
+        model=config.model,
+        n_estimators=config.n_estimators,
+        prediction_chunk_size=config.prediction_chunk_size,
+        min_free_vram_gib=config.min_free_vram_gib,
+        categorical_feature_indices=indices,
+    )
 
 
 def _load_source_recipes(
