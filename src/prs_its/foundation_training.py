@@ -242,6 +242,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
         selected_row, screen_decision = _select_candidate(candidates)
         selected_name = str(selected_row["experiment_name"])
         selected_frame = candidate_frames[selected_name]
+        screen_decision["foundation_model"] = config.model
         _save_json(paths["metrics"] / "foundation_screen_decision.json", screen_decision)
 
         calibration = _calibrate(selected_frame)
