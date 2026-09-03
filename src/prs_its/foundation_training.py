@@ -862,6 +862,7 @@ def _save_seed_artifact(
     result: dict[str, Any],
 ) -> None:
     frame = _oof_frame(train, result["fold_id"], result["oof_pred"])
+    frame["random_seed"] = seed
     frame.to_csv(paths["oof"] / f"{name}_oof_seed_{seed}.csv", index=False)
     if result.get("test_fold_predictions") is not None:
         values = np.asarray(result["test_fold_predictions"], dtype=float)
