@@ -294,6 +294,7 @@ def run_foundation_training(config: FoundationTrainingConfig) -> dict[str, Any]:
             "raw_submission_path": str(raw_submission_path),
             "promoted": False,
             "confirmation_status": "not_run",
+            "fallback_policy": "run tabpfn-3 only in a separate run after TabICLv2 preflight failure or rejection",
             "runtime_seconds": time.monotonic() - started,
             "model_artifacts": "not_saved_locally; retain on remote training server",
         }
