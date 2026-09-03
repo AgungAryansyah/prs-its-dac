@@ -201,7 +201,7 @@ def run_foundation_preflight(
     if fold_cache is not None:
         fold_cache.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    if torch.cuda.is_available():
+    if task_type == "GPU" and torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     estimator = factory(params, seed, fold_cache, task_type)
@@ -211,7 +211,11 @@ def run_foundation_preflight(
             estimator, X.iloc[valid_idx], params.prediction_chunk_size
         )
         _validate_probabilities(probabilities, "Foundation preflight predictions")
-        peak_bytes = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        peak_bytes = (
+            int(torch.cuda.max_memory_allocated())
+            if task_type == "GPU" and torch.cuda.is_available()
+            else 0
+        )
     except Exception as error:
         raise RuntimeError(
             f"Foundation {params.model} CUDA/model preflight failed: {error}"
