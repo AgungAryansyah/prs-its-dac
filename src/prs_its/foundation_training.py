@@ -852,6 +852,11 @@ def _save_seed_artifact(
         for fold, predictions in enumerate(values):
             test_frame[f"fold_{fold}"] = predictions
         test_frame.to_csv(paths["oof"] / f"{name}_test_fold_predictions_seed_{seed}.csv", index=False)
+    fold_metrics = result.get("fold_metrics")
+    if isinstance(fold_metrics, pd.DataFrame):
+        fold_metrics.assign(random_seed=seed).to_csv(
+            paths["metrics"] / f"{name}_fold_metrics_seed_{seed}.csv", index=False
+        )
     result["oof_pred"] = np.asarray(result["oof_pred"], dtype=float)
 
 
