@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import gc
 from pathlib import Path
 import time
@@ -18,6 +18,7 @@ FOUNDATION_MODELS = ("tabicl-v2", "tabpfn-3")
 DEFAULT_FOUNDATION_ESTIMATORS = 4
 DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE = 1024
 DEFAULT_MIN_FREE_VRAM_GIB = 10.0
+TABICL_CACHE_MODES = ("auto", "kv", "repr", "none")
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class FoundationParams:
     prediction_chunk_size: int = DEFAULT_FOUNDATION_PREDICTION_CHUNK_SIZE
     min_free_vram_gib: float = DEFAULT_MIN_FREE_VRAM_GIB
     categorical_feature_indices: tuple[int, ...] = ()
+    tabicl_cache_mode: str = "auto"
 
     def __post_init__(self) -> None:
         if self.model not in FOUNDATION_MODELS:
@@ -40,6 +42,8 @@ class FoundationParams:
             raise ValueError("min_free_vram_gib must be positive.")
         if any(index < 0 for index in self.categorical_feature_indices):
             raise ValueError("categorical_feature_indices must be non-negative.")
+        if self.tabicl_cache_mode not in TABICL_CACHE_MODES:
+            raise ValueError(f"tabicl_cache_mode must be one of {TABICL_CACHE_MODES}.")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,12 +124,22 @@ def train_foundation_cv(
         if fold_cache is not None:
             fold_cache.mkdir(parents=True, exist_ok=True)
         estimator = factory(params, seed + fold, fold_cache, task_type)
+        effective_params = params
         try:
             X_train = X.iloc[train_idx]
             X_valid = X.iloc[valid_idx]
             y_train = labels.iloc[train_idx].to_numpy()
             y_valid = labels.iloc[valid_idx].to_numpy()
-            estimator.fit(X_train, y_train)
+            try:
+                estimator.fit(X_train, y_train)
+            except Exception as error:
+                if not _can_retry_with_repr(params, task_type, error):
+                    raise
+                _release_estimator(estimator)
+                estimator = None
+                effective_params = replace(params, tabicl_cache_mode="repr")
+                estimator = factory(effective_params, seed + fold, fold_cache, task_type)
+                estimator.fit(X_train, y_train)
             valid_pred = _predict_probabilities(
                 estimator, X_valid, params.prediction_chunk_size
             )
@@ -144,6 +158,7 @@ def train_foundation_cv(
                     "train_fraud_prevalence": float(y_train.mean()),
                     "valid_fraud_prevalence": float(y_valid.mean()),
                     "elapsed_seconds": time.monotonic() - started,
+                    "tabicl_cache_mode": effective_params.tabicl_cache_mode,
                 }
             )
             fold_metrics.append(metrics)
@@ -165,13 +180,18 @@ def train_foundation_cv(
     if predict_test:
         assert test_pred is not None
         _validate_probabilities(test_pred, "Foundation test predictions")
+    fold_metrics_frame = pd.DataFrame(fold_metrics)
+    cache_modes = set(fold_metrics_frame.get("tabicl_cache_mode", pd.Series(dtype=object)))
     return {
         "oof_pred": oof_pred,
         "test_pred": test_pred,
         "test_fold_predictions": test_fold_predictions_array,
-        "fold_metrics": pd.DataFrame(fold_metrics),
+        "fold_metrics": fold_metrics_frame,
         "fold_id": fold_id,
         "params": params.as_dict(),
+        "effective_tabicl_cache_mode": (
+            "repr" if cache_modes and "repr" in cache_modes else params.tabicl_cache_mode
+        ),
     }
 
 
@@ -205,8 +225,20 @@ def run_foundation_preflight(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     estimator = factory(params, seed, fold_cache, task_type)
+    effective_params = params
+    cache_fallback = False
     try:
-        estimator.fit(X.iloc[train_idx], pd.Series(y).iloc[train_idx].to_numpy())
+        try:
+            estimator.fit(X.iloc[train_idx], pd.Series(y).iloc[train_idx].to_numpy())
+        except Exception as error:
+            if not _can_retry_with_repr(params, task_type, error):
+                raise
+            _release_estimator(estimator)
+            estimator = None
+            effective_params = replace(params, tabicl_cache_mode="repr")
+            cache_fallback = True
+            estimator = factory(effective_params, seed, fold_cache, task_type)
+            estimator.fit(X.iloc[train_idx], pd.Series(y).iloc[train_idx].to_numpy())
         probabilities = _predict_probabilities(
             estimator, X.iloc[valid_idx], params.prediction_chunk_size
         )
@@ -233,7 +265,9 @@ def run_foundation_preflight(
         "elapsed_seconds": time.monotonic() - started,
         "peak_allocated_bytes": peak_bytes,
         "gpu_status": gpu_status,
-        "params": params.as_dict(),
+        "params": effective_params.as_dict(),
+        "requested_params": params.as_dict(),
+        "cache_fallback": cache_fallback,
     }
 
 
@@ -251,10 +285,16 @@ def _create_estimator(
             raise RuntimeError(
                 "TabICLv2 is unavailable. Install the locked project dependencies with `uv sync`."
             ) from error
+        kv_cache = {
+            "auto": True,
+            "kv": True,
+            "repr": "repr",
+            "none": False,
+        }[params.tabicl_cache_mode]
         return TabICLClassifier(
             n_estimators=params.n_estimators,
             batch_size=params.estimator_batch_size,
-            kv_cache=True,
+            kv_cache=kv_cache,
             device=device,
             use_amp="auto",
             offload_mode="auto",
@@ -326,3 +366,23 @@ def _validate_inputs(
 def _validate_probabilities(values: np.ndarray, name: str) -> None:
     if not np.isfinite(values).all() or not ((0 <= values) & (values <= 1)).all():
         raise RuntimeError(f"{name} must contain finite probabilities within [0, 1].")
+
+
+def _can_retry_with_repr(params: FoundationParams, task_type: str, error: Exception) -> bool:
+    return bool(
+        params.model == "tabicl-v2"
+        and task_type == "GPU"
+        and params.tabicl_cache_mode == "auto"
+        and _is_cuda_oom(error)
+    )
+
+
+def _is_cuda_oom(error: Exception) -> bool:
+    return isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
+
+
+def _release_estimator(estimator: Any) -> None:
+    del estimator
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
