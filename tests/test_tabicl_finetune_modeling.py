@@ -14,6 +14,7 @@ from prs_its.tabicl_finetune_modeling import (
     ensure_tabicl_finetune_gpu_ready,
     fine_tune_with_oom_backoff,
     fit_in_context_predictor,
+    tabicl_inference_kwargs,
     training_data_size_profiles,
 )
 
@@ -134,6 +135,18 @@ def test_finetune_oom_restarts_from_a_new_checkpoint_attempt(tmp_path: Path) -> 
 def test_training_profiles_are_fixed_and_descending() -> None:
     assert training_data_size_profiles(4096) == (4096, 2048, 1024)
     assert training_data_size_profiles(2048) == (2048, 1024)
+
+
+def test_inference_offload_can_be_disabled_without_changing_default(tmp_path: Path) -> None:
+    disk_kwargs = tabicl_inference_kwargs(TabICLFinetuneParams(), tmp_path)
+    gpu_kwargs = tabicl_inference_kwargs(
+        TabICLFinetuneParams(offload_mode=False), tmp_path
+    )
+
+    assert disk_kwargs["offload_mode"] == "disk"
+    assert disk_kwargs["disk_offload_dir"] == str(tmp_path)
+    assert gpu_kwargs["offload_mode"] is False
+    assert "disk_offload_dir" not in gpu_kwargs
 
 
 def test_gpu_preflight_rejects_cpu_execution(monkeypatch) -> None:

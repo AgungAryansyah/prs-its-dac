@@ -20,6 +20,7 @@ def test_lora_base_config_uses_isolated_artifacts_and_adapter_factory(tmp_path) 
     assert base.run_name == "tabicl-lora-test"
     assert base.artifact_prefix == "tabicl_lora"
     assert base.params.learning_rate == 1e-4
+    assert base.params.offload_mode is False
     assert base.finetuner_factory is not None
 
 
@@ -36,6 +37,17 @@ def test_lora_config_rejects_a_full_finetuning_learning_rate(tmp_path) -> None:
             project_root=tmp_path,
             run_name="tabicl-lora-test",
             params=TabICLFinetuneParams(learning_rate=1e-5),
+        )
+
+
+def test_lora_config_rejects_disk_offload(tmp_path) -> None:
+    from prs_its.tabicl_finetune_modeling import TabICLFinetuneParams
+
+    with pytest.raises(ValueError, match="offload_mode=False"):
+        TabICLLoRATrainingConfig(
+            project_root=tmp_path,
+            run_name="tabicl-lora-test",
+            params=TabICLFinetuneParams(learning_rate=1e-4, offload_mode="disk"),
         )
 
 
