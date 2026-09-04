@@ -236,6 +236,7 @@ def attach_frozen_lora_finetuner(estimator: Any, config: TabICLLoRAConfig) -> An
                 "targets": [
                     target.as_dict() for target in self.model_._prs_its_lora_targets
                 ],
+                "inventory": self._prs_its_lora_inventory,
             },
         }
         merged_payload = {

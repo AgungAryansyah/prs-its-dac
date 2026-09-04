@@ -5,6 +5,7 @@ import json
 import platform
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,10 @@ class TabICLFinetuneTrainingConfig:
     show_progress: bool = True
     resume: bool = False
     params: TabICLFinetuneParams = field(default_factory=TabICLFinetuneParams)
+    finetuner_factory: Callable[..., Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+    artifact_prefix: str = "tabicl_ft"
 
     def __post_init__(self) -> None:
         if not self.run_name or not re.fullmatch(r"[A-Za-z0-9_-]+", self.run_name):
@@ -80,6 +85,10 @@ class TabICLFinetuneTrainingConfig:
             raise ValueError("TabICL fine-tuning uses exactly three outer folds.")
         if self.max_runtime_minutes <= 0 or self.n_bootstrap <= 0:
             raise ValueError("Runtime and bootstrap settings must be positive.")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", self.artifact_prefix):
+            raise ValueError(
+                "artifact_prefix may contain only letters, numbers, and underscores."
+            )
 
 
 def tabicl_finetune_output_paths(
@@ -148,6 +157,7 @@ def preflight_tabicl_finetune(config: TabICLFinetuneTrainingConfig) -> dict[str,
         cache_dir=paths["cache"] / "preflight",
         random_state=config.random_state,
         time_limit_seconds=300.0,
+        finetuner_factory=config.finetuner_factory,
     )
     payload = {
         "run_name": config.run_name,
@@ -162,7 +172,7 @@ def preflight_tabicl_finetune(config: TabICLFinetuneTrainingConfig) -> dict[str,
         "checkpoint_validation": result.as_dict(),
         "checkpoint_interface": "TabICL FinetunedTabICLClassifier.fit(output_dir=...)",
     }
-    _save_json(paths["metrics"] / "tabicl_finetune_preflight.json", payload)
+    _save_json(paths["metrics"] / _preflight_filename(config.artifact_prefix), payload)
     return payload
 
 
@@ -186,6 +196,7 @@ def run_tabicl_finetune_training(
     if config.resume:
         preflight = _load_preflight(paths, config, prepared)
     assert preflight is not None
+    artifact_prefix = config.artifact_prefix
 
     fold_rows: list[dict[str, Any]] = []
     test_predictions = np.full((config.n_splits, len(test)), np.nan, dtype=float)
@@ -208,6 +219,7 @@ def run_tabicl_finetune_training(
                 fold,
                 outer_valid_idx,
                 expected_fold_id,
+                artifact_prefix,
             )
             if saved is not None:
                 raw_oof[outer_valid_idx] = saved["oof_pred"]
@@ -237,6 +249,7 @@ def run_tabicl_finetune_training(
                 time_limit_seconds=_remaining_fold_budget(
                     started, config.max_runtime_minutes, config.n_splits - fold + 1
                 ),
+                finetuner_factory=config.finetuner_factory,
             )
             predictor, support_profile = fit_in_context_predictor(
                 lambda checkpoint_path=fold_result.checkpoint_path, predictor_cache=(paths["cache"] / f"fold_{fold}" / "predictor"), predictor_seed=config.random_state + fold: (
@@ -294,6 +307,7 @@ def run_tabicl_finetune_training(
                 valid_pred,
                 test_pred,
                 metrics,
+                artifact_prefix,
             )
             support_manifest_rows.append(
                 _support_manifest_rows(
@@ -325,15 +339,19 @@ def run_tabicl_finetune_training(
                 "fraud_probability_raw": raw_oof,
             }
         )
-        raw_oof_frame.to_csv(paths["oof"] / "tabicl_ft_raw_oof.csv", index=False)
+        raw_oof_frame.to_csv(
+            paths["oof"] / f"{artifact_prefix}_raw_oof.csv", index=False
+        )
         pd.DataFrame(fold_rows).to_json(
-            paths["metrics"] / "tabicl_ft_fold_metrics.json", orient="records", indent=2
+            paths["metrics"] / f"{artifact_prefix}_fold_metrics.json",
+            orient="records",
+            indent=2,
         )
         _save_oof_evaluation(paths, train, raw_oof_frame, config)
         comparison, fairness = _save_ctr_comparison(paths, train, raw_oof_frame, config)
         calibration = _calibrate(raw_oof_frame)
-        _save_calibration_artifacts(paths, raw_oof_frame, calibration)
-        _require_complete_oof_artifacts(paths)
+        _save_calibration_artifacts(paths, raw_oof_frame, calibration, artifact_prefix)
+        _require_complete_oof_artifacts(paths, artifact_prefix)
         _check_budget(
             started, config.max_runtime_minutes, "before final full-data fine-tuning"
         )
@@ -350,7 +368,7 @@ def run_tabicl_finetune_training(
         support_manifest_rows.append(
             _support_manifest_rows(train, final_support.selected_indices, "final", None)
         )
-        _save_support_manifest(paths, support_manifest_rows)
+        _save_support_manifest(paths, support_manifest_rows, artifact_prefix)
         final_test = final_raw_test
         if calibration["method"] != "raw":
             final_test = calibrate_test_predictions(
@@ -363,11 +381,11 @@ def run_tabicl_finetune_training(
         status = "promoted" if decision["promoted"] else "unpromoted"
         submission_path = (
             paths["submissions"]
-            / f"tabicl_ft_{calibration['method']}_{status}_submission.csv"
+            / f"{artifact_prefix}_{calibration['method']}_{status}_submission.csv"
         )
         make_submission(test[ID_COL], final_test, submission_path)
         raw_submission_path = (
-            paths["submissions"] / "tabicl_ft_raw_unpromoted_submission.csv"
+            paths["submissions"] / f"{artifact_prefix}_raw_unpromoted_submission.csv"
         )
         if calibration["method"] != "raw":
             make_submission(test[ID_COL], final_raw_test, raw_submission_path)
@@ -385,9 +403,11 @@ def run_tabicl_finetune_training(
                 },
             }
         )
-        _save_json(paths["metrics"] / "tabicl_ft_promotion_decision.json", decision)
+        _save_json(
+            paths["metrics"] / f"{artifact_prefix}_promotion_decision.json", decision
+        )
         manifest = _run_manifest(config, preflight, started, decision)
-        _save_json(paths["metrics"] / "tabicl_ft_run_manifest.json", manifest)
+        _save_json(paths["metrics"] / f"{artifact_prefix}_run_manifest.json", manifest)
         progress.update(1)
         return {
             "submission_path": submission_path,
@@ -462,10 +482,11 @@ def _load_completed_fold(
     fold: int,
     outer_valid_idx: np.ndarray,
     expected_fold_id: np.ndarray,
+    artifact_prefix: str = "tabicl_ft",
 ) -> dict[str, Any] | None:
-    oof_path = paths["oof"] / f"tabicl_ft_fold_{fold}_oof.csv"
-    test_path = paths["oof"] / f"tabicl_ft_fold_{fold}_test.csv"
-    metrics_path = paths["metrics"] / f"tabicl_ft_fold_{fold}.json"
+    oof_path = paths["oof"] / f"{artifact_prefix}_fold_{fold}_oof.csv"
+    test_path = paths["oof"] / f"{artifact_prefix}_fold_{fold}_test.csv"
+    metrics_path = paths["metrics"] / f"{artifact_prefix}_fold_{fold}.json"
     artifacts = (oof_path, test_path, metrics_path)
     if not any(path.exists() for path in artifacts):
         return None
@@ -526,6 +547,7 @@ def _save_fold_artifacts(
     valid_pred: np.ndarray,
     test_pred: np.ndarray,
     metrics: dict[str, Any],
+    artifact_prefix: str = "tabicl_ft",
 ) -> None:
     pd.DataFrame(
         {
@@ -534,11 +556,11 @@ def _save_fold_artifacts(
             "fold": fold,
             "fraud_probability_raw": valid_pred,
         }
-    ).to_csv(paths["oof"] / f"tabicl_ft_fold_{fold}_oof.csv", index=False)
+    ).to_csv(paths["oof"] / f"{artifact_prefix}_fold_{fold}_oof.csv", index=False)
     pd.DataFrame(
         {ID_COL: test[ID_COL].to_numpy(), "fraud_probability_raw": test_pred}
-    ).to_csv(paths["oof"] / f"tabicl_ft_fold_{fold}_test.csv", index=False)
-    _save_json(paths["metrics"] / f"tabicl_ft_fold_{fold}.json", metrics)
+    ).to_csv(paths["oof"] / f"{artifact_prefix}_fold_{fold}_test.csv", index=False)
+    _save_json(paths["metrics"] / f"{artifact_prefix}_fold_{fold}.json", metrics)
 
 
 def _save_oof_evaluation(
@@ -550,7 +572,7 @@ def _save_oof_evaluation(
     metrics = evaluate_probabilities(
         raw_oof[TARGET], raw_oof["fraud_probability_raw"], AUDIT_FRACTIONS
     )
-    _save_json(paths["metrics"] / "tabicl_ft_oof_metrics.json", metrics)
+    _save_json(paths["metrics"] / f"{config.artifact_prefix}_oof_metrics.json", metrics)
     pd.DataFrame(
         bootstrap_audit_intervals(
             raw_oof[TARGET],
@@ -558,7 +580,9 @@ def _save_oof_evaluation(
             audit_fractions=AUDIT_FRACTIONS,
             n_bootstrap=config.n_bootstrap,
         )
-    ).to_csv(paths["metrics"] / "tabicl_ft_audit_bootstrap.csv", index=False)
+    ).to_csv(
+        paths["metrics"] / f"{config.artifact_prefix}_audit_bootstrap.csv", index=False
+    )
     if {"jkpst", "umur"}.issubset(train.columns):
         fairness = pd.concat(
             [
@@ -577,7 +601,9 @@ def _save_oof_evaluation(
             ],
             ignore_index=True,
         )
-        fairness.to_csv(paths["metrics"] / "tabicl_ft_fairness.csv", index=False)
+        fairness.to_csv(
+            paths["metrics"] / f"{config.artifact_prefix}_fairness.csv", index=False
+        )
 
 
 def _save_ctr_comparison(
@@ -611,7 +637,9 @@ def _save_ctr_comparison(
         n_bootstrap=config.n_bootstrap,
         random_state=config.random_state,
     )
-    comparison.to_csv(paths["metrics"] / "tabicl_ft_vs_ctr_paired.csv", index=False)
+    comparison.to_csv(
+        paths["metrics"] / f"{config.artifact_prefix}_vs_ctr_paired.csv", index=False
+    )
     if not {"jkpst", "umur"}.issubset(train.columns):
         return comparison, {
             "subgroup_rate_deltas": pd.DataFrame(),
@@ -628,10 +656,12 @@ def _save_ctr_comparison(
         random_state=config.random_state,
     )
     fairness["subgroup_rate_deltas"].to_csv(
-        paths["metrics"] / "tabicl_ft_vs_ctr_fairness_rates.csv", index=False
+        paths["metrics"] / f"{config.artifact_prefix}_vs_ctr_fairness_rates.csv",
+        index=False,
     )
     fairness["gap_intervals"].to_csv(
-        paths["metrics"] / "tabicl_ft_vs_ctr_fairness_gaps.csv", index=False
+        paths["metrics"] / f"{config.artifact_prefix}_vs_ctr_fairness_gaps.csv",
+        index=False,
     )
     return comparison, fairness
 
@@ -672,34 +702,37 @@ def _save_calibration_artifacts(
     paths: dict[str, Path],
     candidate: pd.DataFrame,
     calibration: dict[str, Any],
+    artifact_prefix: str = "tabicl_ft",
 ) -> None:
     calibrated = candidate.copy()
     calibrated["fraud_probability_final"] = calibration["selected_oof"]
-    calibrated.to_csv(paths["oof"] / "tabicl_ft_oof.csv", index=False)
+    calibrated.to_csv(paths["oof"] / f"{artifact_prefix}_oof.csv", index=False)
     for method, probabilities in calibration["cross_fitted_oof"].items():
         frame = candidate.copy()
         frame["fraud_probability_raw"] = probabilities
         frame.to_csv(
-            paths["oof"] / f"tabicl_ft_oof_calibrated_{method}.csv", index=False
+            paths["oof"] / f"{artifact_prefix}_oof_calibrated_{method}.csv", index=False
         )
     pd.DataFrame(calibration["rows"]).to_csv(
-        paths["metrics"] / "tabicl_ft_calibration_metrics.csv", index=False
+        paths["metrics"] / f"{artifact_prefix}_calibration_metrics.csv", index=False
     )
     calibration_curve_frame(candidate[TARGET], calibration["selected_oof"]).to_csv(
-        paths["metrics"] / "tabicl_ft_calibration_curve.csv", index=False
+        paths["metrics"] / f"{artifact_prefix}_calibration_curve.csv", index=False
     )
     prediction_distribution(candidate[TARGET], calibration["selected_oof"]).to_csv(
-        paths["metrics"] / "tabicl_ft_prediction_distribution.csv", index=False
+        paths["metrics"] / f"{artifact_prefix}_prediction_distribution.csv", index=False
     )
 
 
-def _require_complete_oof_artifacts(paths: dict[str, Path]) -> None:
+def _require_complete_oof_artifacts(
+    paths: dict[str, Path], artifact_prefix: str = "tabicl_ft"
+) -> None:
     required = (
-        paths["oof"] / "tabicl_ft_raw_oof.csv",
-        paths["oof"] / "tabicl_ft_oof.csv",
-        paths["metrics"] / "tabicl_ft_fold_metrics.json",
-        paths["metrics"] / "tabicl_ft_oof_metrics.json",
-        paths["metrics"] / "tabicl_ft_vs_ctr_paired.csv",
+        paths["oof"] / f"{artifact_prefix}_raw_oof.csv",
+        paths["oof"] / f"{artifact_prefix}_oof.csv",
+        paths["metrics"] / f"{artifact_prefix}_fold_metrics.json",
+        paths["metrics"] / f"{artifact_prefix}_oof_metrics.json",
+        paths["metrics"] / f"{artifact_prefix}_vs_ctr_paired.csv",
     )
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -718,8 +751,8 @@ def _final_full_data_prediction(
     test_claim_ids: pd.Series,
     started: float,
 ):
-    output_path = paths["oof"] / "tabicl_ft_final_test_raw.csv"
-    support_path = paths["metrics"] / "tabicl_ft_final_support.json"
+    output_path = paths["oof"] / f"{config.artifact_prefix}_final_test_raw.csv"
+    support_path = paths["metrics"] / f"{config.artifact_prefix}_final_support.json"
     if config.resume and output_path.exists() and support_path.exists():
         saved = pd.read_csv(output_path)
         if not np.array_equal(saved[ID_COL].to_numpy(), test_claim_ids.to_numpy()):
@@ -744,6 +777,7 @@ def _final_full_data_prediction(
         time_limit_seconds=_remaining_fold_budget(
             started, config.max_runtime_minutes, 1
         ),
+        finetuner_factory=config.finetuner_factory,
     )
     predictor, support = fit_in_context_predictor(
         lambda: create_tabicl_predictor(
@@ -797,8 +831,12 @@ def _support_manifest_rows(
     )
 
 
-def _save_support_manifest(paths: dict[str, Path], frames: list[pd.DataFrame]) -> None:
-    output_path = paths["metrics"] / "tabicl_ft_support_manifest.csv"
+def _save_support_manifest(
+    paths: dict[str, Path],
+    frames: list[pd.DataFrame],
+    artifact_prefix: str = "tabicl_ft",
+) -> None:
+    output_path = paths["metrics"] / f"{artifact_prefix}_support_manifest.csv"
     existing = pd.read_csv(output_path) if output_path.exists() else pd.DataFrame()
     manifest = pd.concat([existing, *frames], ignore_index=True) if frames else existing
     if manifest.empty:
@@ -874,7 +912,9 @@ def _check_budget(started: float, maximum_minutes: float, label: str) -> None:
 def _load_preflight(
     paths: dict[str, Path], config: TabICLFinetuneTrainingConfig, prepared: Any
 ) -> dict[str, Any]:
-    preflight = _load_json(paths["metrics"] / "tabicl_finetune_preflight.json")
+    preflight = _load_json(
+        paths["metrics"] / _preflight_filename(config.artifact_prefix)
+    )
     if preflight.get("params") != config.params.as_dict():
         raise ValueError(
             "Saved TabICL fine-tuning preflight parameters do not match this run."
@@ -945,6 +985,12 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TypeError(f"Expected a JSON object in {path}.")
     return payload
+
+
+def _preflight_filename(artifact_prefix: str) -> str:
+    if artifact_prefix == "tabicl_ft":
+        return "tabicl_finetune_preflight.json"
+    return f"{artifact_prefix}_preflight.json"
 
 
 def _save_json(path: Path, payload: dict[str, Any]) -> None:
