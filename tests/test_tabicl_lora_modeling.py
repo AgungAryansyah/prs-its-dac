@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import types
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
 from torch import nn
@@ -187,7 +190,84 @@ def test_real_tabicl_targets_column_row_and_icl_transformers_only() -> None:
     assert any(path.startswith("col_embedder") for path in target_paths)
     assert any(path.startswith("row_interactor") for path in target_paths)
     assert any(path.startswith("icl_predictor.tf_icl") for path in target_paths)
-    assert all(not name.startswith("icl_predictor.y_encoder") for name in inventory["trainable_parameter_names"])
+    assert all(
+        not name.startswith("icl_predictor.y_encoder")
+        for name in inventory["trainable_parameter_names"]
+    )
+
+
+def test_merged_checkpoint_matches_lora_model_through_tabicl_classifier(
+    tmp_path: Path,
+) -> None:
+    from tabicl import TabICLClassifier
+    from tabicl._model.tabicl import TabICL
+
+    model_config = {
+        "max_classes": 2,
+        "embed_dim": 8,
+        "col_num_blocks": 1,
+        "col_nhead": 2,
+        "col_num_inds": 4,
+        "row_num_blocks": 1,
+        "row_nhead": 2,
+        "row_num_cls": 1,
+        "icl_num_blocks": 1,
+        "icl_nhead": 2,
+    }
+    lora_config = TabICLLoRAConfig()
+    model = TabICL(**model_config)
+    freeze_tabicl_for_lora(model, lora_config)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith("lora_b"):
+                parameter.fill_(0.001)
+    adapter_state = model.state_dict()
+    adapter_path = tmp_path / "adapter.ckpt"
+    merged_path = tmp_path / "merged.ckpt"
+    torch.save({"config": model_config, "state_dict": adapter_state}, adapter_path)
+    torch.save(
+        {"config": model_config, "state_dict": merged_tabicl_state_dict(model)},
+        merged_path,
+    )
+    X_train = pd.DataFrame({"a": [0.0, 1.0, 2.0, 3.0], "b": [1.0, 0.0, 1.0, 0.0]})
+    y_train = np.array([0, 1, 0, 1])
+    X_test = pd.DataFrame({"a": [4.0, 5.0], "b": [1.0, 0.0]})
+    standard = TabICLClassifier(
+        model_path=merged_path,
+        allow_auto_download=False,
+        device="cpu",
+        n_estimators=1,
+        kv_cache=False,
+        verbose=False,
+    ).fit(X_train, y_train)
+    adapter = TabICLClassifier(
+        model_path=merged_path,
+        allow_auto_download=False,
+        device="cpu",
+        n_estimators=1,
+        kv_cache=False,
+        verbose=False,
+    )
+
+    def load_adapter(self) -> None:
+        loaded = TabICL(**model_config)
+        freeze_tabicl_for_lora(loaded, lora_config)
+        loaded.load_state_dict(
+            torch.load(adapter_path, weights_only=False)["state_dict"]
+        )
+        self.model_path_ = adapter_path
+        self.model_config_ = model_config
+        self.model_ = loaded.eval()
+
+    adapter._load_model = types.MethodType(load_adapter, adapter)
+    adapter.fit(X_train, y_train)
+
+    np.testing.assert_allclose(
+        standard.predict_proba(X_test),
+        adapter.predict_proba(X_test),
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_lora_rejects_adapter_dropout() -> None:
