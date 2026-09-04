@@ -39,7 +39,9 @@ class TabICLLoRATrainingConfig:
     show_progress: bool = True
     resume: bool = False
     params: TabICLFinetuneParams = field(
-        default_factory=lambda: TabICLFinetuneParams(learning_rate=1e-4)
+        default_factory=lambda: TabICLFinetuneParams(
+            learning_rate=1e-4, offload_mode=False
+        )
     )
     lora: TabICLLoRAConfig = field(default_factory=TabICLLoRAConfig)
 
@@ -52,6 +54,8 @@ class TabICLLoRATrainingConfig:
             )
         if self.params.learning_rate != 1e-4:
             raise ValueError("Frozen LoRA fine-tuning requires learning_rate=1e-4.")
+        if self.params.offload_mode is not False:
+            raise ValueError("Frozen LoRA fine-tuning requires offload_mode=False.")
 
 
 def preflight_tabicl_lora(config: TabICLLoRATrainingConfig) -> dict[str, Any]:
@@ -242,6 +246,7 @@ def main(argv: list[str] | None = None) -> None:
             prediction_chunk_size=args.prediction_chunk_size,
             min_prediction_chunk_size=args.min_prediction_chunk_size,
             support_cap=args.support_cap,
+            offload_mode=False,
         ),
         lora=TabICLLoRAConfig(rank=args.lora_rank, alpha=args.lora_alpha),
     )

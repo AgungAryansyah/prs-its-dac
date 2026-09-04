@@ -44,6 +44,7 @@ class TabICLFinetuneParams:
     n_estimators_inference: int = 4
     validation_split_ratio: float = 0.10
     finetune_ctx_query_ratio: float = 0.20
+    offload_mode: str | bool = "disk"
 
     def __post_init__(self) -> None:
         if self.epochs < 1:
@@ -77,6 +78,8 @@ class TabICLFinetuneParams:
             raise ValueError("validation_split_ratio must be within (0, 0.5).")
         if not 0 < self.finetune_ctx_query_ratio < 1:
             raise ValueError("finetune_ctx_query_ratio must be within (0, 1).")
+        if self.offload_mode is not False and self.offload_mode != "disk":
+            raise ValueError("offload_mode must be False or 'disk'.")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -360,17 +363,27 @@ def create_tabicl_predictor(
     cache_dir.mkdir(parents=True, exist_ok=True)
     return TabICLClassifier(
         n_estimators=params.n_estimators_inference,
-        batch_size=1,
-        kv_cache="repr",
         model_path=checkpoint_path,
         allow_auto_download=False,
         device="cuda",
-        use_amp="auto",
-        offload_mode="disk",
-        disk_offload_dir=str(cache_dir),
         random_state=random_state,
         verbose=False,
+        **tabicl_inference_kwargs(params, cache_dir),
     )
+
+
+def tabicl_inference_kwargs(
+    params: TabICLFinetuneParams, cache_dir: Path
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "batch_size": 1,
+        "kv_cache": "repr",
+        "use_amp": "auto",
+        "offload_mode": params.offload_mode,
+    }
+    if params.offload_mode == "disk":
+        kwargs["disk_offload_dir"] = str(cache_dir)
+    return kwargs
 
 
 def is_cuda_oom(error: BaseException) -> bool:
@@ -420,13 +433,7 @@ def _create_finetuner(
         verbose=False,
         wandb_kwargs=None,
         eval_metric="roc_auc",
-        extra_classifier_kwargs={
-            "batch_size": 1,
-            "kv_cache": "repr",
-            "offload_mode": "disk",
-            "disk_offload_dir": str(cache_dir),
-            "use_amp": "auto",
-        },
+        extra_classifier_kwargs=tabicl_inference_kwargs(params, cache_dir),
     )
 
 

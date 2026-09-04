@@ -10,7 +10,10 @@ import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
-from prs_its.tabicl_finetune_modeling import TabICLFinetuneParams
+from prs_its.tabicl_finetune_modeling import (
+    TabICLFinetuneParams,
+    tabicl_inference_kwargs,
+)
 
 
 @dataclass(frozen=True)
@@ -293,13 +296,7 @@ def create_lora_finetuner(
         verbose=False,
         wandb_kwargs=None,
         eval_metric="roc_auc",
-        extra_classifier_kwargs={
-            "batch_size": 1,
-            "kv_cache": "repr",
-            "offload_mode": "disk",
-            "disk_offload_dir": str(cache_dir),
-            "use_amp": "auto",
-        },
+        extra_classifier_kwargs=tabicl_inference_kwargs(params, cache_dir),
     )
     return attach_frozen_lora_finetuner(estimator, lora_config)
 
