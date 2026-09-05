@@ -7,7 +7,11 @@ from prs_its.tabicl_finetune_training import (
     _save_support_manifest,
     tabicl_finetune_output_paths,
 )
-from prs_its.tabicl_lora_training import TabICLLoRATrainingConfig, _base_config
+from prs_its.tabicl_lora_training import (
+    TabICLLoRATrainingConfig,
+    _base_config,
+    _parser,
+)
 
 
 def test_lora_base_config_uses_isolated_artifacts_and_adapter_factory(tmp_path) -> None:
@@ -61,3 +65,18 @@ def test_lora_support_manifest_uses_an_isolated_artifact_prefix(tmp_path) -> Non
 
     assert (paths["metrics"] / "tabicl_lora_support_manifest.csv").exists()
     assert not (paths["metrics"] / "tabicl_ft_support_manifest.csv").exists()
+
+
+def test_lora_cli_accepts_completed_fold_checkpoint_export() -> None:
+    args = _parser().parse_args(
+        [
+            "--run-name",
+            "tabicl-lora-test",
+            "--export-checkpoint-submission",
+            "--checkpoint-fold",
+            "0",
+        ]
+    )
+
+    assert args.export_checkpoint_submission is True
+    assert args.checkpoint_fold == 0
