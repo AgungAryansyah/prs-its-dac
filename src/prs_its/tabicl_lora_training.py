@@ -22,6 +22,9 @@ from prs_its.tabicl_finetune_training import (
     preflight_tabicl_finetune,
     run_tabicl_finetune_training,
 )
+from prs_its.tabicl_lora_checkpoint_export import (
+    export_tabicl_lora_checkpoint_submission,
+)
 from prs_its.tabicl_lora_modeling import TabICLLoRAConfig, lora_finetuner_factory
 from prs_its.training import find_project_root
 
@@ -221,6 +224,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--export-checkpoint-submission", action="store_true")
+    parser.add_argument("--checkpoint-fold", type=int)
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -250,9 +255,22 @@ def main(argv: list[str] | None = None) -> None:
         ),
         lora=TabICLLoRAConfig(rank=args.lora_rank, alpha=args.lora_alpha),
     )
-    result = (
-        preflight_tabicl_lora(config)
-        if args.preflight
-        else run_tabicl_lora_training(config)
-    )
+    if args.export_checkpoint_submission:
+        if args.preflight or args.resume:
+            _parser().error(
+                "--export-checkpoint-submission cannot be combined with --preflight or --resume."
+            )
+        result = export_tabicl_lora_checkpoint_submission(
+            _base_config(config, resume=True), args.checkpoint_fold
+        )
+    else:
+        if args.checkpoint_fold is not None:
+            _parser().error(
+                "--checkpoint-fold requires --export-checkpoint-submission."
+            )
+        result = (
+            preflight_tabicl_lora(config)
+            if args.preflight
+            else run_tabicl_lora_training(config)
+        )
     print(json.dumps(result, indent=2, default=str))
