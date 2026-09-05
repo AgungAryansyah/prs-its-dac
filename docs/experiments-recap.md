@@ -1,6 +1,6 @@
 # Experiment Recap
 
-Updated: 2026-09-01
+Updated: 2026-09-05
 
 This log separates experiments with saved run artifacts from experiments that are
 implemented but have not yet been run. Metrics are OOF estimates, not public
@@ -30,6 +30,39 @@ than one seed.
 | `clinical-shape-v1` | `clinical_shape_concentration` | Two-seed result: 7,816 @5%; AP 0.830119; Brier 0.169413 | Narrow cutoff alternative, not default | [findings](../outputs/runs/clinical-shape-v1/metrics/catboost_final_findings.csv) |
 | `xgb-v1` | `te_xgb_support` | Matched-seed AP 0.806620; Brier 0.178927; 7,676 @5% | Not competitive with CTR | [paired comparison](../outputs/runs/xgb-v1/metrics/xgb_vs_ctr_ensemble_paired.csv) |
 | `ctr-xgb-blend-v1` | `ctr_xgb_raw_w02` | Small screen gain did not survive fresh confirmation | Rejected; no promoted submission | [decision](../outputs/runs/ctr-xgb-blend-v1/metrics/promotion_decision.json) |
+
+## Partial TabICLv2 results
+
+`tabicl-ft-v1` and `tabicl-lora-v1` each have saved artifacts for outer folds 0
+and 1 only. They do not yet have a complete three-fold OOF result, calibration,
+fairness comparison, paired CTR comparison, final full-data checkpoint, or a
+promotion decision. The figures below are fold-level evidence, not a basis for
+replacing the CTR incumbent.
+
+| Run | Fold | OOF AP | Brier | ROC-AUC | Fraud caught @5% | Legitimate audits @5% | Peak GPU allocation |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tabicl-ft-v1` | 0 | 0.820714 | 0.175074 | 0.816089 | 2,610 | 59 | 6.96 GiB |
+| `tabicl-ft-v1` | 1 | 0.820685 | 0.174663 | 0.817306 | 2,621 | 48 | 6.74 GiB |
+| `tabicl-lora-v1` | 0 | 0.821379 | 0.174969 | 0.816381 | 2,614 | 55 | 8.28 GiB |
+| `tabicl-lora-v1` | 1 | 0.821212 | 0.174484 | 0.817957 | 2,619 | 50 | 8.28 GiB |
+
+The full-fine-tune run uses up to 12 epochs at a learning rate of `1e-5`.
+LoRA freezes the pretrained base and trains rank-8, alpha-16 adapters across 84
+attention/MLP projections plus the classification decoder; its preflight recorded
+1,235,978 trainable and 27,016,696 frozen parameters. Both runs used a 4096-row
+training context, full outer-training support, and 256-row prediction chunks
+without an OOM fallback.
+
+LoRA has higher AP and lower Brier in both matching folds. Its 5% audit result is
+mixed: four additional fraud claims in fold 0 and two fewer in fold 1. Resume both
+runs through fold 2 and final training before selecting calibration, producing a
+final submission, or applying the promotion gate.
+
+Sources: [full fine-tuning fold 0](../outputs/runs/tabicl-ft-v1/metrics/tabicl_ft_fold_0.json),
+[full fine-tuning fold 1](../outputs/runs/tabicl-ft-v1/metrics/tabicl_ft_fold_1.json),
+[LoRA preflight](../outputs/runs/tabicl-lora-v1/metrics/tabicl_lora_preflight.json),
+[LoRA fold 0](../outputs/runs/tabicl-lora-v1/metrics/tabicl_lora_fold_0.json), and
+[LoRA fold 1](../outputs/runs/tabicl-lora-v1/metrics/tabicl_lora_fold_1.json).
 
 ## Detailed experiment record
 
@@ -201,6 +234,7 @@ have no performance claim yet.
 
 `ctr-v1` with `dati2_typeppk` remains the strongest general, reproducible incumbent.
 Frequency variants were ruled out, clinical shape is a small cutoff-specific trade-off,
-and target-encoded XGBoost was not competitive. Causal history and TabM should only
-be considered improvements if their paired, fresh-seed, fairness, and grouped-CV gates
-show a meaningful gain over CTR.
+and target-encoded XGBoost was not competitive. The available TabICL folds are
+promising but incomplete, so they do not change this conclusion. Causal history and
+TabM should only be considered improvements if their paired, fresh-seed, fairness, and
+grouped-CV gates show a meaningful gain over CTR.
