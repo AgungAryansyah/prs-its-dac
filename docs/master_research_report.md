@@ -186,25 +186,32 @@ in an ExtraTrees diagnostic, not causal importance for `ctr-v1`.
 
 ## 8. Model Development Findings
 
+The table below is refreshed directly from the saved `outputs/` OOF artifacts.
+For complete runs, it evaluates the raw OOF probability column using the common
+floor-based 3%, 5%, and 7% audit convention. The TabICL rows are per-fold ranges,
+not pooled OOF results. Historical holdout and ranking-only evidence remains in
+the surrounding sections because matching output artifacts are unavailable.
+
 | Experiment | Model/configuration | Recall@3% | Recall@5% | Recall@7% | NormalizedRecall@5% | Captured@5% | AP | Brier | Confirmation/status |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| Initial CatBoost holdout | CatBoost baseline | 0.05854 | 0.09657 | 0.13372 | 0.96692 | 1,549/1,602 | 0.81666 | 0.17522 | Baseline holdout |
-| Initial ExtraTrees holdout | ExtraTrees baseline | 0.05910 | 0.09731 | 0.13422 | 0.97441 | 1,561/1,602 | 0.80389 | 0.18454 | Holdout recommendation |
-| `ctr-v1` | CatBoost native CTR + `dati2_typeppk` | — | — | — | — | 7,808/8,008 | 0.830660 | 0.169182 | Incumbent OOF |
-| `frequency-v1` | Frequency control | — | — | — | — | 7,809/8,008 | 0.830627 | 0.169203 | Rejected variants; control tie |
-| `clinical-shape-v1` | Two-seed shape concentration | — | — | — | — | 7,816/8,008 | 0.830119 | 0.169413 | Narrow alternative, not default |
-| `xgb-v1` | Target-encoded XGBoost support | — | — | — | — | 7,676/8,008 | 0.806620 | 0.178927 | Rejected |
-| `tabm-v1` | 30% piecewise TabM + CTR blend | — | — | — | 0.976274 | 7,818/8,008 | 0.832558 | 0.168178 | Screen-eligible; rejected by paired-capture gate |
-| `tabm-hpo-v1` | HPO piecewise TabM (`k=16`, trial 7) + 50% CTR blend | — | — | — | 0.975150 | 7,809/8,008 | 0.832018 | 0.168193 | Screen-eligible; fresh capture −2; unpromoted |
-| `foundation-v1` | 50% TabICLv2 blend over saved CTR--TabM base | — | — | — | 0.979645 | 7,845/8,008 | 0.831123 | 0.169094 | Screen-eligible; confirmation not run; unpromoted |
-| `tabicl-ft-v1` | TabICLv2 full fine-tuning, two completed folds | — | — | — | 0.977894–0.982016 | 2,610–2,621 / 2,669 per fold | 0.820685–0.820714 | 0.174663–0.175074 | Incomplete; not comparable to full OOF |
-| `tabicl-lora-v1` | TabICLv2 LoRA fine-tuning, two completed folds | — | — | — | 0.979393–0.981266 | 2,614–2,619 / 2,669 per fold | 0.821212–0.821379 | 0.174484–0.174969 | Incomplete; not comparable to full OOF |
-| R005 | Regularized LambdaMART | 0.05027 | 0.08154 | 0.11067 | 0.81668 | 6,540/8,008 | 0.626013 | N/A | Best LambdaMART screen |
-| R016 | Top-10% selective reranker + boundary distance | 0.05883 | 0.09704 | 0.13431 | 0.97190 | 7,783/8,008 | 0.829870 | N/A | Best R009–R017 candidate, not promoted |
+| Baseline | Final CatBoost baseline | 0.058714 | 0.096854 | 0.134010 | 0.970030 | 7,768/8,008 | 0.824615 | 0.171754 | Complete OOF |
+| `deep-ensemble-v1` | Three-seed refined CatBoost ensemble | 0.058851 | 0.097141 | 0.134633 | 0.972902 | 7,791/8,008 | 0.827844 | 0.170418 | Complete OOF |
+| `ctr-v1` | CatBoost native CTR + `dati2_typeppk` | 0.058925 | 0.097353 | 0.134982 | 0.975025 | 7,808/8,008 | 0.830660 | 0.169182 | Incumbent; complete OOF |
+| `frequency-v1` | CatBoost CTR frequency control | 0.058888 | 0.097365 | 0.135095 | 0.975150 | 7,809/8,008 | 0.830627 | 0.169203 | Complete OOF; variants rejected |
+| `clinical-shape-v1` | Two-seed clinical-shape concentration | 0.058950 | 0.097453 | 0.134808 | 0.976024 | 7,816/8,008 | 0.830119 | 0.169413 | Complete OOF; narrow alternative |
+| `xgb-v1` | Target-encoded XGBoost ensemble | 0.058290 | 0.095707 | 0.131653 | 0.958541 | 7,676/8,008 | 0.806620 | 0.178927 | Complete OOF; rejected |
+| `ctr-xgb-blend-v1` screen | 2% XGBoost + matched CTR | 0.058925 | 0.097403 | 0.134883 | 0.975524 | 7,812/8,008 | 0.830330 | 0.169329 | Screen-selected |
+| `ctr-xgb-blend-v1` confirmation | 2% XGBoost + fresh-confirmation CTR | 0.058925 | 0.097328 | 0.135007 | 0.974775 | 7,806/8,008 | 0.829252 | 0.169780 | Confirmation rejected |
+| `tabm-v1` | 30% piecewise TabM + CTR blend | 0.058988 | 0.097478 | 0.135182 | 0.976274 | 7,818/8,008 | 0.832558 | 0.168178 | Paired-capture gate rejected |
+| `tabm-hpo-v1` | HPO piecewise TabM (`k=16`, trial 7) + 50% CTR blend | 0.058963 | 0.097365 | 0.134845 | 0.975150 | 7,809/8,008 | 0.832018 | 0.168193 | Fresh capture −2; unpromoted |
+| `foundation-v1` | 50% TabICLv2 blend over saved CTR--TabM base | 0.059137 | 0.097814 | 0.135369 | 0.979645 | 7,845/8,008 | 0.831123 | 0.169094 | Confirmation not run; unpromoted |
+| `tabicl-ft-v1` | TabICLv2 full fine-tuning, two completed folds | 0.058989–0.059099 | 0.097625–0.098040 | 0.135296–0.135553 | 0.977894–0.982016 | 2,610–2,621 / 2,669 per fold | 0.820685–0.820714 | 0.174663–0.175074 | Incomplete; not comparable to full OOF |
+| `tabicl-lora-v1` | TabICLv2 LoRA fine-tuning, two completed folds | 0.058839–0.059099 | 0.097774–0.097965 | 0.135258–0.135366 | 0.979393–0.981266 | 2,614–2,619 / 2,669 per fold | 0.821212–0.821379 | 0.174484–0.174969 | Incomplete; not comparable to full OOF |
 
-The OOF and holdout rows must not be compared as if they were identical
-validation protocols. LambdaMART values are ranking scores; Brier is correctly
-not reported for them.
+The complete OOF rows remain screening or confirmation evidence unless their
+saved promotion decision says otherwise. Their point estimates must not be used
+to claim a replacement for `ctr-v1` without the required paired and fresh-seed
+confirmation.
 
 ## 9. Ranking-Oriented Findings
 
